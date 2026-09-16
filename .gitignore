@@ -1,1 +1,6 @@
 .DS_Store
+
+# The Phase 1 server's database directory. Accounts live here and nowhere else, so this is
+# state rather than content: a checkout gets a fresh one on first boot (server/lib/db.js) and
+# a container gets the bind mount from server/compose.yaml.
+server/data/

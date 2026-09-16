@@ -1,0 +1,75 @@
+# Local run: `docker compose -f server/compose.yaml up --build`, then http://localhost:8081
+#
+# The build context is the parent directory, not this one. The image serves the client
+# (index.html, css/, js/) as well as the API, and the client lives at the repository root,
+# so the context has to be the root and this file has to point at it from here.
+#
+# Storage. Persistent state follows the project's `/volume1/docker/<store>` convention (see
+# dockhand-tanks-evolved/deploy.sh), where "store" is the project name:
+#
+#   /volume1/docker/tanks-evolved/          <- this stack
+#   /volume1/docker/tanks-evolved/data/     <- bind-mounted here onto /data
+#
+#   The directory is state, not content, and the container writes to it continuously
+#   (SQLite's database, plus its -wal and -shm siblings), so it must be writable by uid
+#   1000 — the image's unprivileged `node` user:
+#
+#     install -d -o 1000 -g 1000 /volume1/docker/tanks-evolved/data
+#
+#   /volume1 does not exist on a workstation, and Docker cannot create it under macOS's
+#   read-only root, so override the path there:
+#
+#     TANKS_DATA_DIR=$PWD/server/data docker compose -f server/compose.yaml up --build
+#
+# Healthcheck. The image carries one; this restates it so the stack is self-describing. It
+# asks /api/health rather than the page, because that endpoint is answered by the running
+# process and reports the version it read from js/version.js — so a healthy stack means the
+# accounts database opened and this build is serving, not merely that a port is bound.
+
+name: tanks-evolved-server
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    image: tanks-evolved-server:local
+    restart: unless-stopped
+
+    ports:
+      # Host 8081 by default, container always 8081 (see the Dockerfile's PORT and EXPOSE).
+      # Change the left-hand side only if 8081 is taken.
+      - "${TANKS_PORT:-8081}:8081"
+
+    environment:
+      # Off by default for a plain-http local run: a Secure cookie is dropped by the
+      # browser over http://, so turning this on without TLS behind it locks everybody out.
+      # Set to 1 when this runs behind a TLS terminator.
+      TANKS_SECURE_COOKIES: "${TANKS_SECURE_COOKIES:-0}"
+      TZ: "${TZ:-UTC}"
+
+    volumes:
+      - ${TANKS_DATA_DIR:-/volume1/docker/tanks-evolved/data}:/data
+
+    # --- Hardening ---------------------------------------------------------------------
+    # The image already runs as the unprivileged node user, so these are the container-level
+    # settings worth keeping alongside it — the same shape as the static site's
+    # docker-compose.yml in the repository root.
+    #
+    # read_only is safe because the process writes to exactly one place, and it is the bind
+    # mount above: SQLite keeps the database, its WAL and its shared-memory file together in
+    # /data. /tmp is on tmpfs for anything a library decides it wants a temp file for; the
+    # mode is not needed here (unlike the nginx stack) because nothing in this image has a
+    # pre-chowned directory under a mount point.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||'8081')+'/api/health').then(r=>r.json()).then(b=>process.exit(b&&b.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

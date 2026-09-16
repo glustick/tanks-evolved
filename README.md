@@ -1,9 +1,12 @@
-# Tanks Evolved — Phase 0
+# Tanks Evolved
 
 A modernised turn-based artillery duel in the spirit of *Artillery Duel* / *Scorched
 Earth*: two tanks trade arcing, wind-affected shells across a destructible
-landscape. Local hot-seat only — no server, no accounts, no networking, no build
-step.
+landscape.
+
+The game is still a no-build static site that works from `file://` and plays local
+hot-seat. Alongside it, `server/` holds the Phase 1 account service that networked
+play is being built on — see [Server](#server).
 
 ```
 open tanks-evolved/index.html          # works straight from disk (file://)
@@ -60,7 +63,49 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `nginx.conf` | MIME types, cache headers, gzip and the `try_files` fallback — the whole server config. |
 | `docker-compose.yml` | Local run on `:8080`, with a read-only root filesystem and tmpfs for nginx's writable paths. |
 | `.dockerignore` | Keeps `tools/`, `README.md` and the git history out of the build context and the image. |
-| `.github/workflows/ci.yml` | CI: the two Node suites, the browser checks, and a container smoke test. |
+| `server/index.js` | Phase 1 server entry point: env → database → listen, plus signal and crash handling. |
+| `server/lib/` | The service itself: routing, static serving, scrypt passwords, cookie sessions, rate limiting, SQLite storage. |
+| `server/test/auth.test.js` | 20-check auth suite over real HTTP against a spawned server, no dependencies. |
+| `server/Dockerfile` | `node:24-alpine`, unprivileged, healthchecked. Built from the repository root. |
+| `.github/workflows/ci.yml` | CI: the Node suites, the browser checks, the container smoke test, and image publication. |
+
+## Server
+
+`server/` is the Phase 1 account service that networked play is being built on: a
+zero-dependency Node 24 program using only `node:http`, `node:crypto` and `node:sqlite` —
+no `package.json`, no `node_modules`. It serves the client and the API from one origin,
+which is what keeps CORS and cross-site cookies out of the design entirely.
+
+```bash
+node server/index.js                              # http://127.0.0.1:8081
+PORT=9000 TANKS_DB=/tmp/t.db node server/index.js # or point it somewhere else
+```
+
+| Endpoint | |
+| --- | --- |
+| `GET /api/health` | `{ ok, version }` — the container healthcheck target, no auth |
+| `POST /api/auth/register` | `{ email, password }` → session cookie |
+| `POST /api/auth/login` | `{ email, password }` → session cookie |
+| `POST /api/auth/logout` | ends the session |
+| `GET /api/me` | the current user, or 401 |
+
+Anything else under `/api/` is a JSON 404, or a 405 with `Allow` for a known path with the
+wrong method. Every other path serves the client under the same rules as `nginx.conf`.
+
+Passwords use scrypt with the cost parameters stored per row, so the work factor can be
+raised later without invalidating existing hashes. Sessions are opaque 32-byte tokens in
+an `HttpOnly`, `SameSite=Lax` cookie, and only `sha256(token)` is stored — a copy of the
+sessions table is not a set of usable credentials. An unknown email spends the same scrypt
+work as a real verification, so login cannot be used to discover which addresses are
+registered. The auth endpoints are rate-limited per IP.
+
+**Not yet:** email verification, password reset, and honouring `X-Forwarded-For` — the
+per-IP limit currently treats every request arriving through a reverse proxy as one
+client, so that needs fixing before this is exposed publicly.
+
+```bash
+node server/test/auth.test.js     # 20 checks over real HTTP, no dependencies
+```
 
 ## Determinism
 
@@ -164,14 +209,15 @@ the test harness at the same URLs as the game.
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main`, on every pull request, and on
-`workflow_dispatch`. Four jobs, nothing installed in any of them:
+`workflow_dispatch`. Five jobs, nothing installed in any of them:
 
 | Job | Node | What it runs |
 | --- | --- | --- |
 | `suite` | `22` and `24` | `node tools/check-determinism.js`, then `node tools/check-static.js` |
 | `browser` | `22` | `tools/headless-check.sh`, then `node tools/check-ui.js`, against the runner's Chrome |
 | `docker` | — | `docker build`, then `curl` the running container for real game markup |
-| `publish` | — | Builds and pushes `ghcr.io/<owner>/tanks-evolved` — **only** on `main` or a `v*` tag, and only after the three checks above pass |
+| `server` | `24` | `node server/test/auth.test.js` — the server needs 24 for `node:sqlite` |
+| `publish` | — | Builds and pushes both images — **only** on `main` or a `v*` tag, and only after every check above has passed |
 
 The browser job resolves `google-chrome`/`chromium` on the runner and passes the path
 through `CHROME`. Both tools exit `2` when they cannot find a browser, and CI turns that

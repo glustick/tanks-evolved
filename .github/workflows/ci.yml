@@ -1,12 +1,12 @@
 name: CI
 
-# The project is a static site with no build step and no dependencies, so CI is four
-# independent questions with four different answers: does the simulation still behave
-# (Node), does the page still boot in a real browser (Chrome), does the artifact we
-# would actually ship serve the game (Docker), and — only once all three say yes — can
-# it be published for the host that runs it (GHCR). Nothing is installed anywhere;
-# every check below runs as-is, which is the whole point of the repo having no
-# dependencies.
+# The project is a static client plus a zero-dependency server, so CI is five
+# independent questions: does the simulation still behave (Node), does the page still
+# boot in a real browser (Chrome), does the artifact we would actually ship serve the
+# game (Docker), do accounts and sessions still work (the server suite), and — only once
+# everything says yes — can the images be published for the host that runs them (GHCR).
+# Nothing is installed anywhere; every check below runs as-is, which is the whole point
+# of the repo having no dependencies.
 
 on:
   push:
@@ -174,6 +174,22 @@ jobs:
         if: always()
         run: docker rm -f tanks-evolved-ci || true
 
+  # The server is a separate program with its own runtime floor, so it gets its own job
+  # rather than joining the client matrix: node:sqlite is why it needs Node 24, and
+  # running this suite on 22 would fail for a reason unrelated to the change under test.
+  server:
+    name: server auth suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Accounts, sessions and storage (20 checks)
+        run: node server/test/auth.test.js
+
   # The only job that writes outside this repository, so it is gated twice over: it
   # never runs for a pull request, and it waits on all three checks above. The image
   # is what the Dockhand host actually runs, so a test failure must not be able to
@@ -181,7 +197,7 @@ jobs:
   publish:
     name: publish image
     runs-on: ubuntu-latest
-    needs: [suite, browser, docker]
+    needs: [suite, browser, docker, server]
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' &&
@@ -203,10 +219,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          IMAGE="ghcr.io/${{ github.repository }}"
           SHORT="$(git rev-parse --short HEAD)"
-          # One source of truth for the version — the same RELEASE_VERSION the HUD
-          # shows and ./publish.sh reads, so a pushed tag cannot drift from the page.
+          # One source of truth for the version — the same RELEASE_VERSION the HUD shows
+          # and ./publish.sh reads, so a pushed tag cannot drift from the page.
           VERSION="$(sed -n "s/.*RELEASE_VERSION *= *'\([0-9][0-9.]*\)'.*/\1/p" js/version.js | head -1)"
           if [ -z "$VERSION" ]; then
             echo "::error::could not read RELEASE_VERSION from js/version.js"
@@ -220,20 +235,34 @@ jobs:
             TAGS+=("${{ github.ref_name }}")
           fi
 
-          ARGS=()
-          for t in "${TAGS[@]}"; do ARGS+=(-t "$IMAGE:$t"); done
+          # Two images, two Dockerfiles, one context. The static image is the nginx host
+          # the game has always been; the server image is the Node service that serves the
+          # same client plus /api/. Both are built from the repository root because the
+          # client lives above server/.
+          push_image() {
+            local image="$1" dockerfile="$2"
+            local args=()
+            for t in "${TAGS[@]}"; do args+=(-t "$image:$t"); done
+            docker build "${args[@]}" -f "$dockerfile" .
+            for t in "${TAGS[@]}"; do
+              echo "pushing $image:$t"
+              docker push "$image:$t"
+            done
+          }
 
-          docker build "${ARGS[@]}" .
+          STATIC="ghcr.io/${{ github.repository }}"
+          SERVER="ghcr.io/${{ github.repository }}-server"
 
-          for t in "${TAGS[@]}"; do
-            echo "pushing $IMAGE:$t"
-            docker push "$IMAGE:$t"
-          done
+          push_image "$STATIC" Dockerfile
+          push_image "$SERVER" server/Dockerfile
 
           {
-            echo "### Published image"
+            echo "### Published images"
             echo
-            echo "\`$IMAGE\`"
-            echo
-            for t in "${TAGS[@]}"; do echo "- \`$IMAGE:$t\`"; done
+            for image in "$STATIC" "$SERVER"; do
+              echo "\`$image\`"
+              echo
+              for t in "${TAGS[@]}"; do echo "- \`$image:$t\`"; done
+              echo
+            done
           } >> "$GITHUB_STEP_SUMMARY"

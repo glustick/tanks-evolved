@@ -1,0 +1,45 @@
+# server/.dockerignore — what the server image's build does not need.
+#
+# Two things about this file are easy to get wrong, so they are stated here rather than
+# discovered later:
+#
+#   1. Docker resolves ignore patterns against the ROOT OF THE BUILD CONTEXT, not against
+#      the directory this file is in. This image is built from the repository root
+#      (`docker build -f server/Dockerfile .`) because the client it serves — index.html,
+#      css/, js/ — lives there, above server/. So the patterns below are written as
+#      `server/...`; a bare `lib/` would match nothing anywhere.
+#
+#   2. Docker loads exactly two ignore files on its own: `<context-root>/.dockerignore`,
+#      and `<path-to-Dockerfile>.dockerignore` if that file exists — which takes
+#      precedence. `server/.dockerignore` is neither name, so it is wired in as
+#      `server/Dockerfile.dockerignore`, a symlink to this file (BuildKit does follow it;
+#      verified by building with a pattern that would break the build if it were ignored).
+#      The repo-root .dockerignore carries the same server/ exclusions, so building without
+#      the symlink produces the same context.
+#
+# Nothing here is load-bearing for the image's *contents* — server/Dockerfile copies exact
+# paths, and a stray file in the context cannot reach the image. It is load-bearing for one
+# thing that must never be uploaded at all: a local database.
+
+# Local state. A SQLite file and its -wal/-shm siblings are not build input, and a dev
+# database sitting in a build context is one `COPY . .` away from being in an image.
+server/data
+
+# The acceptance suite. It runs from a checkout, never inside the image, and it spawns the
+# server on an ephemeral port — not something an image build should be doing.
+server/test
+
+# Build inputs for this image, not contents of it.
+server/Dockerfile.dockerignore
+server/compose.yaml
+docker-compose.yml
+
+# Version control, CI and documentation: the checkout is not the artifact.
+.git
+.gitignore
+.github
+README.md
+tools
+
+# macOS noise.
+.DS_Store
