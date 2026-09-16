@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Tanks Evolved — Phase 0</title>
+  <meta name="description" content="A modernised turn-based artillery duel. Local hot-seat, static site, no build step." />
+  <!-- data: URI so opening from file:// never issues a favicon request -->
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <h1>Tanks&nbsp;Evolved</h1>
+        <span class="version" id="version-tag">v0.1.0+b1</span>
+      </div>
+
+      <div class="chips">
+        <div class="chip">
+          <span class="chip-key">Turn</span>
+          <span class="chip-val" id="turn-value">1</span>
+        </div>
+        <div class="chip">
+          <span class="chip-key">Phase</span>
+          <span class="chip-val" id="state-value">AIMING</span>
+        </div>
+        <div class="chip chip-active">
+          <span class="chip-key">Active</span>
+          <span class="chip-val" id="active-value">PLAYER 1</span>
+        </div>
+        <div class="chip chip-wind">
+          <span class="chip-key">Wind</span>
+          <span class="wind-arrow" id="wind-arrow">&middot;</span>
+          <span class="chip-val" id="wind-value">0.0</span>
+          <span class="chip-unit">m/s</span>
+        </div>
+
+        <div class="chip chip-seed">
+          <label class="chip-key" for="seed-input">Seed</label>
+          <input id="seed-input" class="seed-input" type="text" value="EAGLE-4821"
+                 spellcheck="false" autocomplete="off" autocapitalize="characters" maxlength="24" />
+          <button id="seed-set" class="btn tiny" type="button">Set</button>
+          <button id="seed-random" class="btn tiny ghost" type="button">New map</button>
+        </div>
+
+        <button id="mute-btn" class="btn tiny ghost" type="button" aria-pressed="false">Sound on</button>
+      </div>
+    </header>
+
+    <main class="stage-wrap">
+      <canvas id="stage" width="1280" height="720" aria-label="Battlefield view"></canvas>
+      <p class="stage-hint">Drag on the battlefield to aim · sliders and keys below</p>
+    </main>
+
+    <footer class="controls">
+      <section class="tank-card" id="card-p1">
+        <header class="tank-head">
+          <span class="dot dot-p1" aria-hidden="true"></span>
+          <h2>Player 1</h2>
+          <span class="hp" id="hp-p1">100</span>
+        </header>
+        <div class="bar"><i class="bar-fill" id="bar-p1"></i></div>
+        <p class="aim" id="aim-p1">45&deg; &middot; 60%</p>
+      </section>
+
+      <section class="aim-controls">
+        <div class="slider-row">
+          <label for="angle-slider">Angle</label>
+          <input id="angle-slider" type="range" min="0" max="90" step="1" value="45" />
+          <output id="angle-readout" for="angle-slider">45&deg;</output>
+        </div>
+        <div class="slider-row">
+          <label for="power-slider">Power</label>
+          <input id="power-slider" type="range" min="5" max="100" step="1" value="60" />
+          <output id="power-readout" for="power-slider">60%</output>
+        </div>
+        <button id="fire-btn" class="btn fire" type="button">Fire <kbd>space</kbd></button>
+      </section>
+
+      <section class="tank-card" id="card-p2">
+        <header class="tank-head">
+          <span class="dot dot-p2" aria-hidden="true"></span>
+          <h2>Player 2</h2>
+          <span class="hp" id="hp-p2">100</span>
+        </header>
+        <div class="bar"><i class="bar-fill" id="bar-p2"></i></div>
+        <p class="aim" id="aim-p2">45&deg; &middot; 60%</p>
+      </section>
+    </footer>
+
+    <p class="shortcuts">
+      <kbd>A</kbd><kbd>D</kbd> power
+      <kbd>W</kbd><kbd>S</kbd> angle
+      <kbd>Shift</kbd> fine
+      <kbd>Space</kbd> fire
+      <kbd>R</kbd> rematch
+      <kbd>N</kbd> new map
+      <kbd>M</kbd> mute
+    </p>
+  </div>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">Player 1 wins</h2>
+      <p id="modal-sub">Seed EAGLE-4821</p>
+      <div class="modal-actions">
+        <button id="rematch-btn" class="btn fire" type="button">Rematch</button>
+        <button id="modal-new-seed" class="btn" type="button">New map</button>
+        <button id="modal-close" class="btn ghost" type="button">View board</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Load order matters: version/utils first, then the simulation, then the
+       presentation layers, then the bootstrap at the bottom of this file. -->
+  <script src="js/version.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/terrain.js"></script>
+  <script src="js/physics.js"></script>
+  <script src="js/tanks.js"></script>
+  <script src="js/render.js"></script>
+  <script src="js/audio.js"></script>
+  <script src="js/input.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/selftest.js"></script>
+  <script>
+    // Bootstrap. The hash `#selftest` swaps the interactive loop for the
+    // automated checks in js/selftest.js (see README) — those drive the
+    // simulation themselves, so the animation loop stays off for that run.
+    (function () {
+      var selftest = TE.selftest && TE.selftest.requested(window.location.hash);
+      var app = TE.game.boot({ autoLoop: !selftest });
+      if (!app) return;
+      window.addEventListener('load', function () { TE.render.resize(app.renderer); });
+      if (selftest) TE.selftest.run(app);
+    })();
+  </script>
+</body>
+</html>
