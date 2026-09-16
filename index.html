@@ -47,6 +47,13 @@
         </div>
 
         <button id="mute-btn" class="btn tiny ghost" type="button" aria-pressed="false">Sound on</button>
+
+        <!-- The realtime connection indicator, and the way back to the lobby. "LOCAL" is
+             what a page opened from disk shows: no server was looked for at all. -->
+        <button id="net-chip" class="chip chip-net is-local" type="button" title="Local hot-seat play">
+          <span class="chip-key">Server</span>
+          <span class="chip-val" id="net-status">LOCAL</span>
+        </button>
       </div>
     </header>
 
@@ -114,8 +121,71 @@
     </div>
   </div>
 
+  <!-- Sign in / create an account. Only ever opens when a server answered, and only ever
+       covers the board: the game behind it is already running. -->
+  <div class="screen" id="auth-screen" hidden>
+    <div class="screen-card">
+      <h2 id="auth-title">Sign in</h2>
+      <p class="screen-sub" id="auth-subtitle">Sign in to play online. Local hot-seat is one click away either way.</p>
+
+      <form id="auth-form" class="screen-form" novalidate>
+        <label class="field">
+          <span>Email</span>
+          <input id="auth-email" type="email" name="email" autocomplete="username"
+                 spellcheck="false" autocapitalize="none" placeholder="gunner@example.com" />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="auth-password" type="password" name="password" autocomplete="current-password"
+                 placeholder="at least 8 characters" />
+        </label>
+        <p class="form-error" id="auth-error" role="alert" hidden></p>
+        <div class="screen-actions">
+          <button id="auth-submit" class="btn fire" type="submit">Sign in</button>
+          <button id="auth-toggle" class="btn" type="button">Create an account</button>
+          <button id="auth-local" class="btn ghost" type="button">Play locally instead</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- The lobby: what is open, the quick-match queue, and the game you are already in. -->
+  <div class="screen" id="lobby-screen" hidden>
+    <div class="screen-card wide">
+      <header class="lobby-head">
+        <h2>Lobby</h2>
+        <span class="lobby-who" id="lobby-who"></span>
+        <button id="lobby-refresh" class="btn tiny ghost" type="button">Refresh</button>
+        <button id="logout-btn" class="btn tiny ghost" type="button">Sign out</button>
+        <button id="lobby-local" class="btn tiny ghost" type="button">Local hot-seat</button>
+      </header>
+
+      <p class="form-error" id="lobby-error" role="alert" hidden></p>
+
+      <section class="lobby-own" id="my-game" hidden>
+        <h3 id="my-game-title">Your game</h3>
+        <p class="lobby-meta" id="my-game-meta"></p>
+        <div class="screen-actions">
+          <button id="my-game-load" class="btn tiny" type="button">Load this map locally</button>
+          <button id="my-game-cancel" class="btn tiny ghost" type="button">Cancel this game</button>
+        </div>
+      </section>
+
+      <section class="lobby-actions">
+        <button id="host-btn" class="btn fire" type="button">Host a game</button>
+        <button id="queue-btn" class="btn" type="button" aria-pressed="false">Quick match</button>
+        <span class="queue-state" id="queue-state" aria-live="polite"></span>
+      </section>
+
+      <h3 class="lobby-heading">Open games <span class="lobby-count" id="lobby-count">0</span></h3>
+      <ul class="lobby-games" id="lobby-games"></ul>
+      <p class="lobby-empty" id="lobby-empty">Nobody is hosting right now &mdash; host a game, or try a quick match.</p>
+    </div>
+  </div>
+
   <!-- Load order matters: version/utils first, then the simulation, then the
-       presentation layers, then the bootstrap at the bottom of this file. -->
+       presentation layers, then the network layer and the screens it feeds, then the
+       bootstrap at the bottom of this file. -->
   <script src="js/version.js"></script>
   <script src="js/utils.js"></script>
   <script src="js/terrain.js"></script>
@@ -125,6 +195,8 @@
   <script src="js/audio.js"></script>
   <script src="js/input.js"></script>
   <script src="js/game.js"></script>
+  <script src="js/net.js"></script>
+  <script src="js/screens.js"></script>
   <script src="js/selftest.js"></script>
   <script>
     // Bootstrap. The hash `#selftest` swaps the interactive loop for the
@@ -135,7 +207,15 @@
       var app = TE.game.boot({ autoLoop: !selftest });
       if (!app) return;
       window.addEventListener('load', function () { TE.render.resize(app.renderer); });
-      if (selftest) TE.selftest.run(app);
+      if (selftest) {
+        // The self-test is an offline harness: it must not have a network screen appear
+        // over its report, and it is run from file:// where there is no server anyway.
+        TE.selftest.run(app);
+      } else {
+        // The lobby is an addition, not a gate. The board above is already playable and
+        // stays playable: this only opens a screen if a server answers (see screens.js).
+        TE.screens.init({ app: app, document: document });
+      }
     })();
   </script>
 </body>

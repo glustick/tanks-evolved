@@ -387,7 +387,176 @@ input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55)
   backdrop-filter: blur(6px);
   z-index: 20;
 }
-.modal[hidden] { display: none; }   /* author display must not beat [hidden] */
+/* ------------------------------------------------------------- screen panels */
+/* The sign-in and lobby screens sit over the board, like the win overlay does. Every
+   one of them is toggled with the `hidden` attribute, so this one rule keeps that honest:
+   without !important, any display below would quietly win over the UA's [hidden] rule and
+   the screen would never close. It is also what the win overlay used to need a rule of
+   its own for, so the rule that was there is gone rather than duplicated. */
+[hidden] { display: none !important; }
+
+.screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(3, 6, 11, 0.76);
+  backdrop-filter: blur(8px);
+  z-index: 18;
+  overflow-y: auto;
+}
+
+.screen-card {
+  width: min(430px, 100%);
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: linear-gradient(180deg, #0d1420, #080c14);
+  padding: 24px 22px 20px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.screen-card.wide { width: min(620px, 100%); }
+.screen-card h2 { font-size: 21px; letter-spacing: -0.02em; }
+.screen-card h3 { margin: 0; font-size: 12.5px; font-weight: 600; }
+
+.screen-sub {
+  margin: 6px 0 18px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.screen-form { display: flex; flex-direction: column; gap: 12px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field span {
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+}
+.field input {
+  padding: 9px 11px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+.field input:focus {
+  border-color: rgba(120, 180, 255, 0.5);
+  box-shadow: 0 0 0 3px rgba(120, 180, 255, 0.12);
+}
+
+.screen-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+.form-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #ffd7d7;
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.1);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+
+/* ------------------------------------------------------------------- lobby */
+.lobby-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.lobby-who {
+  margin-right: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.lobby-own {
+  border: 1px solid rgba(63, 224, 196, 0.35);
+  background: linear-gradient(180deg, var(--p1-dim), transparent 70%);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lobby-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.queue-state { font-size: 11.5px; color: var(--warn); }
+.btn.is-waiting {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.14);
+  color: #ffe6b8;
+}
+
+.lobby-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 9px;
+  font-size: 10px !important;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+}
+.lobby-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.lobby-games { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.lobby-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.lobby-name { font-weight: 600; font-size: 13px; }
+.lobby-meta {
+  margin-right: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.lobby-empty { margin: 0; font-size: 12px; color: var(--muted-2); }
+
+/* The connection indicator. Same shape as the other chips, but it is a button: it is
+   also how a player gets back to the lobby. */
+.chip-net {
+  font-family: inherit;
+  cursor: pointer;
+  appearance: none;
+  text-align: left;
+}
+.chip-net .chip-val { font-size: 11px; letter-spacing: 0.06em; }
+.chip-net.is-live { border-color: rgba(74, 222, 128, 0.45); }
+.chip-net.is-live .chip-val { color: var(--good); }
+.chip-net.is-offline { border-color: rgba(248, 113, 113, 0.4); }
+.chip-net.is-offline .chip-val { color: var(--bad); }
+.chip-net.is-local .chip-val { color: var(--muted-2); }
 
 .modal-card {
   width: min(420px, 100%);

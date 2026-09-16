@@ -11,6 +11,7 @@
 
 const http = require('node:http');
 const { createApi, isApiPath } = require('./api');
+const { createLobby } = require('./lobby');
 const { createLimiters } = require('./ratelimit');
 const { readReleaseVersion } = require('./version');
 const { sendJson, clientIp } = require('./http');
@@ -40,7 +41,8 @@ function createApp({ config, database }) {
     fail(`cannot read RELEASE_VERSION from js/version.js: ${err.message}`);
   }
 
-  const api = createApi({ config, database, version, limiters: createLimiters(config.rateLimit) });
+  const lobby = createLobby({ config, database });
+  const api = createApi({ config, database, version, limiters: createLimiters(config.rateLimit), lobby });
 
   function onRequest(req, res) {
     const startedAt = process.hrtime.bigint();
@@ -101,6 +103,12 @@ function createApp({ config, database }) {
    * is the point: nothing that arrives after the database is closed can find it shut.
    */
   async function close() {
+    // The event streams first, and before the server stops accepting: server.close()
+    // waits for in-flight requests, and a stream is one that would never finish on its
+    // own — so a redeploy would otherwise sit out its whole grace period waiting for
+    // connections this process can simply close.
+    lobby.close();
+
     await new Promise((resolve) => {
       server.close(resolve);
       // Idle keep-alive sockets would otherwise hold this open for as long as a browser
@@ -111,7 +119,7 @@ function createApp({ config, database }) {
     storage.closeDatabase(database);
   }
 
-  return { server, version, config, close };
+  return { server, version, config, lobby, close };
 }
 
 module.exports = { createApp, LOGGED_PATH_MAX };

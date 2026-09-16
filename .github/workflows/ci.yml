@@ -3,10 +3,10 @@ name: CI
 # The project is a static client plus a zero-dependency server, so CI is five
 # independent questions: does the simulation still behave (Node), does the page still
 # boot in a real browser (Chrome), does the artifact we would actually ship serve the
-# game (Docker), do accounts and sessions still work (the server suite), and — only once
-# everything says yes — can the images be published for the host that runs them (GHCR).
-# Nothing is installed anywhere; every check below runs as-is, which is the whole point
-# of the repo having no dependencies.
+# game (Docker), do accounts, sessions and the lobby still work (the server suites), and
+# — only once everything says yes — can the images be published for the host that runs
+# them (GHCR). Nothing is installed anywhere; every check below runs as-is, which is the
+# whole point of the repo having no dependencies.
 
 on:
   push:
@@ -39,7 +39,7 @@ jobs:
       - name: Simulation core (9 checks)
         run: node tools/check-determinism.js
 
-      - name: Static constraints (6 checks)
+      - name: Static constraints (7 checks)
         run: node tools/check-static.js
 
   browser:
@@ -176,9 +176,9 @@ jobs:
 
   # The server is a separate program with its own runtime floor, so it gets its own job
   # rather than joining the client matrix: node:sqlite is why it needs Node 24, and
-  # running this suite on 22 would fail for a reason unrelated to the change under test.
+  # running these suites on 22 would fail for a reason unrelated to the change under test.
   server:
-    name: server auth suite
+    name: server suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -187,13 +187,22 @@ jobs:
         with:
           node-version: "24"
 
+      # Two suites, one process shape: each spawns the real server on an ephemeral port
+      # against a database in a temporary directory. The lobby suite also measures time —
+      # a dropped stream is expected to clean up after a few hundred milliseconds of
+      # configured grace — so it is given the runner's whole step rather than a timeout
+      # tuned for a laptop.
       - name: Accounts, sessions and storage (20 checks)
         run: node server/test/auth.test.js
 
+      - name: Lobby, matchmaking and the event stream (21 checks)
+        run: node server/test/lobby.test.js
+        timeout-minutes: 5
+
   # The only job that writes outside this repository, so it is gated twice over: it
-  # never runs for a pull request, and it waits on all three checks above. The image
-  # is what the Dockhand host actually runs, so a test failure must not be able to
-  # publish over a working deployment.
+  # never runs for a pull request, and it waits on every check above. The image is what
+  # the Dockhand host actually runs, so a test failure must not be able to publish over a
+  # working deployment.
   publish:
     name: publish image
     runs-on: ubuntu-latest

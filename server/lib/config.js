@@ -35,7 +35,34 @@ const DEFAULTS = {
   loginMax: 10,
   loginWindowMs: 5 * MINUTE,
   registerMax: 5,
-  registerWindowMs: 60 * MINUTE
+  registerWindowMs: 60 * MINUTE,
+  // Hosting is the same kind of write as registering — a row an anonymous client asked
+  // for — but a player hosts and cancels repeatedly while they wait for a friend, so the
+  // budget is per ten minutes rather than per hour. Queueing is cheaper still and toggled
+  // more (waiting for an opponent is exactly when someone changes their mind).
+  gamesMax: 20,
+  gamesWindowMs: 10 * MINUTE,
+  queueMax: 30,
+  queueWindowMs: 5 * MINUTE,
+  // The SSE keepalive. Short enough that an idle proxy does not close a quiet stream
+  // (nginx's proxy_read_timeout defaults to 60s), long enough to be free: the same tick
+  // also sweeps abandoned games.
+  streamKeepaliveMs: 20 * 1000,
+  // How long a player's queue entry and hosted game survive their last stream closing.
+  // EventSource retries on its own after a few seconds, and a reconnect must not cost
+  // anybody their place.
+  streamGraceMs: 15 * 1000,
+  // How long a game may sit with nobody connected before it is swept. A losing network
+  // connection must not end a match, so this is minutes rather than seconds — and the
+  // sweep runs often enough to act on it promptly, which is a separate number because
+  // the two answer different questions.
+  abandonMs: 30 * MINUTE,
+  sweepMs: 60 * 1000,
+  // An event stream is a socket held open until the browser goes away, and a browser can
+  // open as many as it likes. This is what stops one account from holding the process's
+  // file descriptors: eight is more tabs than anybody plays with, and fewer than a
+  // hostile client would want.
+  maxStreamsPerUser: 8
 };
 
 /**
@@ -95,8 +122,21 @@ function loadConfig(env = process.env) {
       register: {
         max: integer(env, 'TANKS_REGISTER_MAX', DEFAULTS.registerMax, 1, 10000, warnings),
         windowMs: integer(env, 'TANKS_REGISTER_WINDOW_MS', DEFAULTS.registerWindowMs, 1000, 24 * 60 * MINUTE, warnings)
+      },
+      games: {
+        max: integer(env, 'TANKS_GAMES_MAX', DEFAULTS.gamesMax, 1, 10000, warnings),
+        windowMs: integer(env, 'TANKS_GAMES_WINDOW_MS', DEFAULTS.gamesWindowMs, 1000, 24 * 60 * MINUTE, warnings)
+      },
+      queue: {
+        max: integer(env, 'TANKS_QUEUE_MAX', DEFAULTS.queueMax, 1, 10000, warnings),
+        windowMs: integer(env, 'TANKS_QUEUE_WINDOW_MS', DEFAULTS.queueWindowMs, 1000, 24 * 60 * MINUTE, warnings)
       }
     },
+    streamKeepaliveMs: integer(env, 'TANKS_STREAM_KEEPALIVE_MS', DEFAULTS.streamKeepaliveMs, 1000, 10 * MINUTE, warnings),
+    streamGraceMs: integer(env, 'TANKS_STREAM_GRACE_MS', DEFAULTS.streamGraceMs, 0, 10 * MINUTE, warnings),
+    abandonMs: integer(env, 'TANKS_ABANDON_MS', DEFAULTS.abandonMs, 1000, 24 * 60 * MINUTE, warnings),
+    sweepMs: integer(env, 'TANKS_SWEEP_MS', DEFAULTS.sweepMs, 100, 60 * MINUTE, warnings),
+    maxStreamsPerUser: integer(env, 'TANKS_MAX_STREAMS_PER_USER', DEFAULTS.maxStreamsPerUser, 1, 1024, warnings),
     warnings
   };
 }

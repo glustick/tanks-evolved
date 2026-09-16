@@ -6,8 +6,9 @@
  *   - the HUD range sliders / fire button
  *   - pointer drag on the battlefield canvas
  *
- * This file is the only place that knows about element ids, and `REQUIRED_IDS`
- * is exported so the self-test can assert the markup still matches the code.
+ * This file is the only place that knows about the game's element ids, and
+ * `REQUIRED_IDS` is exported so the self-test can assert the markup still
+ * matches the code. The lobby screens keep their own list, in screens.js.
  */
 (function (root) {
   'use strict';
@@ -69,6 +70,24 @@
   function setClass(node, name, on) {
     if (!node || !node.classList) return;
     if (on) node.classList.add(name); else node.classList.remove(name);
+  }
+
+  /**
+   * Whether an element owns the keys it is given.
+   *
+   * A text field is not a game control: typing "NOMAD" into the seed box, or an email
+   * address into the lobby's sign-in form, must not fire the new-map shortcut on the way
+   * past. Range sliders are excluded deliberately — they are game controls, and they keep
+   * focus after a click, so treating them as text would silently kill the shortcuts.
+   */
+  function isTextEntry(el) {
+    if (!el || !el.tagName) return false;
+    var tag = el.tagName.toUpperCase();
+    if (tag === 'TEXTAREA') return true;
+    if (tag !== 'INPUT') return false;
+    var type = String(el.type || 'text').toLowerCase();
+    return type !== 'range' && type !== 'checkbox' && type !== 'radio'
+      && type !== 'button' && type !== 'submit';
   }
 
   /**
@@ -157,12 +176,13 @@
       var tank = activeTank();
       var step = stepSize(ev);
 
-      // Never swallow browser shortcuts (Cmd/Ctrl/Alt + key), and let the seed
-      // field own its keys while it has focus — otherwise typing "NOMAD" would
-      // trigger the new-map shortcut on every keystroke.
+      // Never swallow browser shortcuts (Cmd/Ctrl/Alt + key). Nor should the board take
+      // keys while a screen is over it: the lobby may be open in front of a match that
+      // is still, in every other sense, live.
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (TE.screens && TE.screens.isOpen && TE.screens.isOpen()) return;
       var focused = doc && doc.activeElement;
-      if (focused && focused.id === 'seed-input') return;
+      if (isTextEntry(focused)) return;
 
       switch (key) {
         case 'ArrowLeft': case 'a': case 'A':
@@ -445,6 +465,7 @@
     REQUIRED_IDS: REQUIRED_IDS,
     STATE_LABELS: STATE_LABELS,
     attach: attach,
+    isTextEntry: isTextEntry,
     normaliseSeed: normaliseSeed,
     randomSeedLabel: randomSeedLabel
   };

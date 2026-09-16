@@ -64,7 +64,9 @@ function createBucket({ max, windowMs }) {
 function createLimiters(rateLimit) {
   return {
     login: createBucket(rateLimit.login),
-    register: createBucket(rateLimit.register)
+    register: createBucket(rateLimit.register),
+    games: createBucket(rateLimit.games),
+    queue: createBucket(rateLimit.queue)
   };
 }
 

@@ -56,6 +56,64 @@ function sendStatus(res, status, headers) {
 }
 
 /**
+ * Returned by a handler that has taken the socket over itself rather than describing a
+ * response. The dispatcher's whole contract is that it writes the response, and this is
+ * the one documented exception: without it, sendJson would append a JSON body to an open
+ * event stream. A symbol rather than a flag on the response, so it cannot collide with
+ * anything a handler returns by accident.
+ */
+const RESPONSE_TAKEN = Symbol('response-taken');
+
+/**
+ * Turn a response into a Server-Sent Events stream.
+ *
+ * The headers are flushed immediately rather than with the first event, so the browser's
+ * EventSource fires `onopen` — and the client's connection indicator can say "live" —
+ * without waiting for somebody else to do something in the lobby.
+ */
+function openEventStream(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    // Per-session by definition: an intermediary that cached this would replay one
+    // player's events to another.
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    Connection: 'keep-alive',
+    // nginx buffers proxied responses by default, which for a stream that changes once a
+    // minute means the client sees nothing until the buffer fills.
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+
+  // A socket that dies between events would otherwise emit its EPIPE here, and an
+  // unhandled 'error' on a response is an uncaught exception. The stream's own 'close'
+  // handler is what cleans up; this only stops the noise.
+  res.on('error', () => {});
+
+  return res;
+}
+
+/**
+ * Write one SSE event. JSON.stringify never emits a raw newline, so the data field is
+ * always a single line and needs no escaping beyond that.
+ */
+function writeEvent(res, event, data) {
+  if (!isWritable(res)) return false;
+  return res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+/** A comment line: SSE's keepalive. Invisible to the client, but it keeps the socket warm. */
+function writeComment(res, text) {
+  if (!isWritable(res)) return false;
+  return res.write(`: ${text}\n\n`);
+}
+
+/** Whether a response can still take bytes. Consumers come and go; the writer does not. */
+function isWritable(res) {
+  return !res.writableEnded && !res.destroyed;
+}
+
+/**
  * The peer address, for rate limiting and the access log.
  *
  * Deliberately not X-Forwarded-For: nothing here is configured with a trusted proxy,
@@ -135,4 +193,15 @@ function readJsonBody(req, limit) {
   });
 }
 
-module.exports = { httpError, isHttpError, sendJson, sendStatus, clientIp, readJsonBody };
+module.exports = {
+  httpError,
+  isHttpError,
+  sendJson,
+  sendStatus,
+  openEventStream,
+  writeEvent,
+  writeComment,
+  RESPONSE_TAKEN,
+  clientIp,
+  readJsonBody
+};

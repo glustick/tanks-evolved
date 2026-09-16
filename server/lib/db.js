@@ -1,5 +1,5 @@
 /**
- * db.js — the whole persistence layer: one SQLite file, two tables, and the handful of
+ * db.js — the whole persistence layer: one SQLite file, three tables, and the handful of
  * statements the API needs.
  *
  * node:sqlite is synchronous, which is the right shape here. These are index lookups
@@ -8,8 +8,10 @@
  * it happens outside this module.
  *
  * The schema is applied on boot with CREATE TABLE IF NOT EXISTS, so a fresh volume is a
- * working database and a restart is a no-op. No migration framework: two tables whose
- * shape is only ever added to do not need one yet.
+ * working database and a restart is a no-op. A *column* added to a table that already
+ * exists is the one thing that statement cannot do — the deployed volume predates
+ * Phase 2 — so those go through MIGRATIONS below. Everything else is genuinely
+ * additive, which is why there is still no migration framework.
  */
 'use strict';
 
@@ -35,7 +37,12 @@ const SCHEMA = `
     kdf_r         INTEGER NOT NULL,
     kdf_p         INTEGER NOT NULL,
     kdf_keylen    INTEGER NOT NULL,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    -- What other players see, and the only part of an account that leaves the server:
+    -- an email address is a credential-recovery target and is nobody else's business.
+    -- The DEFAULT exists for MIGRATIONS' sake (a NOT NULL column needs one to be added
+    -- to an existing table); every write path supplies a real value.
+    display_name  TEXT    NOT NULL DEFAULT ''
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -52,7 +59,52 @@ const SCHEMA = `
   -- that lookup. This index is for the sweeps and for the ON DELETE CASCADE.
   CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
+
+  -- A game is one row for its whole life: open (hosted, waiting for an opponent),
+  -- playing (both players known, seed issued), and nothing else yet — Phase 3 ends a
+  -- match, and 'finished' arrives with it.
+  CREATE TABLE IF NOT EXISTS games (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- NULL until somebody joins. The seed is issued by the server at that moment and
+    -- by nobody else, which is what makes it trustworthy as a shared map.
+    seed       TEXT,
+    host_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- NULL while the game is open, which is also how "is there an opponent" is read.
+    guest_id   INTEGER          REFERENCES users(id) ON DELETE CASCADE,
+    status     TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    started_at INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_games_host_id ON games (host_id);
+  CREATE INDEX IF NOT EXISTS idx_games_guest_id ON games (guest_id);
+  CREATE INDEX IF NOT EXISTS idx_games_status ON games (status);
 `;
+
+/**
+ * Columns that were added to a table after that table was first deployed.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op on a volume that already has the table, so a
+ * column written into SCHEMA above would never reach the running database: the table
+ * exists, and SQLite is never asked to create it. Each entry is therefore applied by
+ * name — PRAGMA first, ALTER only if the column is absent — which is idempotent on both
+ * the fresh and the deployed path, and is what keeps a deploy from being a flag day.
+ */
+const MIGRATIONS = [
+  {
+    table: 'users',
+    column: 'display_name',
+    add: "ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    // Existing accounts get the local part of their address, which is exactly what
+    // displayNameFor() gives a new one, so there is one rule for both rather than a
+    // generation of accounts that behaves differently.
+    backfill: `UPDATE users
+                  SET display_name = CASE WHEN instr(email, '@') > 1
+                                          THEN substr(email, 1, instr(email, '@') - 1)
+                                          ELSE email END
+                WHERE display_name = '' OR display_name IS NULL`
+  }
+];
 
 /**
  * PRAGMAs are applied per connection, on every boot. WAL keeps readers from blocking on
@@ -103,6 +155,22 @@ function describe(err) {
 }
 
 /**
+ * Apply MIGRATIONS to a database that may already hold data.
+ *
+ * The column list comes from PRAGMA table_info rather than from a version number: what
+ * matters is whether this column is here, and asking the table itself cannot drift out
+ * of step with the file the way a recorded version can.
+ */
+function applyMigrations(db) {
+  for (const migration of MIGRATIONS) {
+    const columns = db.prepare(`PRAGMA table_info(${migration.table})`).all().map((row) => row.name);
+    if (columns.includes(migration.column)) continue;
+    db.exec(migration.add);
+    db.exec(migration.backfill);
+  }
+}
+
+/**
  * Open (creating if needed) the database and make sure the schema is present.
  *
  * The directory is created here rather than expected to exist: the container bind-mounts
@@ -130,6 +198,7 @@ function openDatabase(file) {
   try {
     for (const pragma of PRAGMAS) db.prepare(`PRAGMA ${pragma}`).get();
     db.exec(SCHEMA);
+    applyMigrations(db);
   } catch (err) {
     fail(`cannot prepare the database ${file}: ${describe(err)}`);
   }
@@ -146,6 +215,23 @@ function closeDatabase(db) {
 
 // ---------------------------------------------------------------------- users
 
+/** A display name is rendered in somebody else's lobby list, so it is bounded. */
+const DISPLAY_NAME_MAX = 32;
+
+/**
+ * The display name for an account: the local part of its address.
+ *
+ * Derived rather than asked for, because Phase 2 has no profile editing and a name is
+ * needed the moment an account exists. The same rule is what the migration above
+ * computes in SQL for accounts that predate the column. Not unique, and never an
+ * identity: the user id is, and this is only ever a label next to it.
+ */
+function displayNameFor(email) {
+  const at = email.indexOf('@');
+  const local = at > 0 ? email.slice(0, at) : email;
+  return local.slice(0, DISPLAY_NAME_MAX);
+}
+
 /**
  * Insert an account, returning its id or null when the email is already taken.
  *
@@ -156,8 +242,8 @@ function closeDatabase(db) {
 function insertUser(db, user) {
   try {
     const info = db.prepare(
-      `INSERT INTO users (email, password_hash, password_salt, kdf, kdf_n, kdf_r, kdf_p, kdf_keylen, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (email, password_hash, password_salt, kdf, kdf_n, kdf_r, kdf_p, kdf_keylen, created_at, display_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       user.email,
       user.passwordHash,
@@ -167,7 +253,8 @@ function insertUser(db, user) {
       user.kdfR,
       user.kdfP,
       user.kdfKeylen,
-      user.createdAt
+      user.createdAt,
+      displayNameFor(user.email)
     );
     return Number(info.lastInsertRowid);
   } catch (err) {
@@ -181,13 +268,138 @@ function findUserByEmail(db, email) {
   return db.prepare('SELECT * FROM users WHERE email = ?').get(email) || null;
 }
 
+/** The row for an id, for the paths that need a display name rather than a password. */
+function findUserById(db, id) {
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(id) || null;
+}
+
 /**
- * The public shape of a user. Every response body goes through here, which is what makes
- * "the hash never leaves the server" a property of one function rather than a rule to
- * remember at each call site.
+ * The public shape of *your own* account. Every response body about the caller goes
+ * through here, which is what makes "the hash never leaves the server" a property of one
+ * function rather than a rule to remember at each call site.
  */
 function toPublicUser(row) {
   return { id: Number(row.id), email: row.email, createdAt: Number(row.created_at) };
+}
+
+/**
+ * The public shape of *any* player, including other players. Two fields, on purpose:
+ * an id to key on and a name to render. Anything added here is visible to everyone who
+ * can see a game, so an email address can never be one of them.
+ */
+function toPublicPlayer(row) {
+  return { id: Number(row.id), displayName: row.display_name };
+}
+
+// ---------------------------------------------------------------------- games
+
+// The two states a game can be in. Exported rather than spelled out at each call site
+// because they are compared in several places and a typo would read as "not open".
+const GAME_OPEN = 'open';
+const GAME_PLAYING = 'playing';
+
+/**
+ * The row shape every game query returns: the game, plus the display name of each
+ * participant in the same statement. Joining here rather than per game is what keeps the
+ * lobby a single query — and joining users at all is what makes an email address
+ * structurally impossible to leak through a game.
+ */
+const GAME_COLUMNS = `
+  SELECT g.id, g.seed, g.status, g.created_at, g.started_at,
+         h.id AS host_id, h.display_name AS host_name,
+         u.id AS guest_id, u.display_name AS guest_name
+    FROM games g
+    JOIN users h ON h.id = g.host_id
+    LEFT JOIN users u ON u.id = g.guest_id
+`;
+
+/** The public shape of a game. The only place a game becomes a response body. */
+function toPublicGame(row) {
+  return {
+    id: Number(row.id),
+    status: row.status,
+    seed: row.seed === null ? null : String(row.seed),
+    createdAt: Number(row.created_at),
+    startedAt: row.started_at === null ? null : Number(row.started_at),
+    host: { id: Number(row.host_id), displayName: row.host_name },
+    guest: row.guest_id === null ? null : { id: Number(row.guest_id), displayName: row.guest_name }
+  };
+}
+
+function findGameById(db, id) {
+  return db.prepare(`${GAME_COLUMNS} WHERE g.id = ?`).get(id) || null;
+}
+
+/** Newest first: a player scrolling the lobby wants the game that just appeared on top. */
+function listOpenGames(db) {
+  return db.prepare(`${GAME_COLUMNS} WHERE g.status = ? ORDER BY g.id DESC`).all(GAME_OPEN);
+}
+
+/**
+ * The caller's own live game — open or playing — or null. Newest first, because that is
+ * the one a player means by "my game" if they somehow have more than one.
+ */
+function findLiveGameForUser(db, userId) {
+  return db.prepare(
+    `${GAME_COLUMNS} WHERE g.status IN (?, ?) AND (g.host_id = ? OR g.guest_id = ?) ORDER BY g.id DESC LIMIT 1`
+  ).get(GAME_OPEN, GAME_PLAYING, userId, userId) || null;
+}
+
+/** A game this player is hosting and nobody has joined yet, or null. */
+function findOpenGameHostedBy(db, userId) {
+  return db.prepare(`${GAME_COLUMNS} WHERE g.host_id = ? AND g.status = ? LIMIT 1`).get(userId, GAME_OPEN) || null;
+}
+
+function insertGame(db, game) {
+  const info = db.prepare(
+    `INSERT INTO games (seed, host_id, guest_id, status, created_at, started_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(game.seed, game.hostId, game.guestId, game.status, game.createdAt, game.startedAt);
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Fill the empty seat, returning whether this call is the one that got it.
+ *
+ * `status = 'open'` in the WHERE clause is the entire concurrency control: two players
+ * racing for one game both run this UPDATE, exactly one changes a row, and the other is
+ * told the game is gone rather than quietly becoming its second guest.
+ */
+function claimGame(db, id, guestId, seed, startedAt) {
+  const info = db.prepare(
+    `UPDATE games SET guest_id = ?, seed = ?, status = ?, started_at = ?
+      WHERE id = ? AND status = ?`
+  ).run(guestId, seed, GAME_PLAYING, startedAt, id, GAME_OPEN);
+  return Number(info.changes) === 1;
+}
+
+function deleteGame(db, id) {
+  return Number(db.prepare('DELETE FROM games WHERE id = ?').run(id).changes);
+}
+
+/** Cancel whatever this player is hosting that nobody has joined. Returns how many. */
+function deleteOpenGamesHostedBy(db, userId) {
+  return Number(db.prepare('DELETE FROM games WHERE host_id = ? AND status = ?').run(userId, GAME_OPEN).changes);
+}
+
+/**
+ * Games that have been sitting around since before `cutoff`, for the lobby's sweep.
+ *
+ * A playing game is filtered by when it *started* and an open one by when it was created,
+ * so both mean "nobody has touched this for a while". The caller still has to check
+ * whether anybody is connected: this is the half that storage can answer.
+ */
+function listStaleGames(db, cutoff) {
+  return db.prepare(
+    `SELECT id, host_id, guest_id FROM games
+      WHERE (status = ? AND created_at <= ?) OR (status = ? AND started_at <= ?)`
+  ).all(GAME_OPEN, cutoff, GAME_PLAYING, cutoff);
+}
+
+function deleteGames(db, ids) {
+  if (ids.length === 0) return 0;
+  const placeholders = ids.map(() => '?').join(', ');
+  return Number(db.prepare(`DELETE FROM games WHERE id IN (${placeholders})`).run(...ids).changes);
 }
 
 // ------------------------------------------------------------------- sessions
@@ -242,10 +454,26 @@ module.exports = {
   closeDatabase,
   insertUser,
   findUserByEmail,
+  findUserById,
   toPublicUser,
+  toPublicPlayer,
+  displayNameFor,
   insertSession,
   findSessionUser,
   deleteSession,
   deleteExpiredSessions,
-  isUniqueViolation
+  isUniqueViolation,
+  GAME_OPEN,
+  GAME_PLAYING,
+  toPublicGame,
+  findGameById,
+  listOpenGames,
+  findLiveGameForUser,
+  findOpenGameHostedBy,
+  insertGame,
+  claimGame,
+  deleteGame,
+  deleteOpenGamesHostedBy,
+  listStaleGames,
+  deleteGames
 };

@@ -1,17 +1,24 @@
 /**
- * api.js — the JSON surface: five endpoints and the rules that apply to all of them.
+ * api.js — the JSON surface: the Phase 1 account endpoints and the Phase 2 lobby, plus
+ * the rules that apply to all of them.
  *
  * Every handler is a plain function returning a description of the response, and the
  * dispatcher below is the only place that writes one. That keeps the cookie flags, the
  * rate limiter, the error shape and the logging hook from drifting apart per route, and
- * it means a handler cannot accidentally bypass them.
+ * it means a handler cannot accidentally bypass them. The one exception is the event
+ * stream, which has no end and therefore cannot be described — it returns
+ * RESPONSE_TAKEN and owns its socket from there.
+ *
+ * The HTTP rules live here and the bookkeeping lives in lobby.js: this file decides what
+ * a 409 means, that module decides who is connected and who is waiting.
  */
 'use strict';
 
-const { httpError, isHttpError, readJsonBody, sendJson, clientIp } = require('./http');
+const { httpError, isHttpError, readJsonBody, sendJson, clientIp, RESPONSE_TAKEN } = require('./http');
 const { requireEmail, requirePassword } = require('./validate');
 const passwords = require('./passwords');
 const sessions = require('./sessions');
+const { makeSeed } = require('./lobby');
 const storage = require('./db');
 const logger = require('./logger');
 
@@ -33,10 +40,10 @@ function isApiPath(pathname) {
 
 /**
  * @param {{config: object, database: object, version: string, limiters: object,
- *   now?: () => number}} deps
+ *   lobby: object, now?: () => number}} deps
  * @returns {{handle: (req, res, url) => Promise<void>, routes: object[]}}
  */
-function createApi({ config, database, version, limiters, now = Date.now }) {
+function createApi({ config, database, version, limiters, lobby, now = Date.now }) {
   /**
    * Count this attempt against the endpoint's bucket and refuse it if the window is
    * full. Counted before the body is read or validated: an attempt is an attempt, and a
@@ -134,6 +141,208 @@ function createApi({ config, database, version, limiters, now = Date.now }) {
     return { status: 200, body: { user: requireUser(ctx.req) } };
   }
 
+  // --------------------------------------------------------------------- lobby
+
+  /**
+   * The caller's own live game, or null.
+   *
+   * A *playing* game does not stand in the way of anything: a player who has finished
+   * one match must be able to start another, and Phase 2 has no way to end a game yet.
+   * What it does do is appear in every lobby payload as `you.game`, so nobody loses
+   * track of the match they are already in.
+   */
+  function liveGameFor(userId) {
+    const row = storage.findLiveGameForUser(database, userId);
+    return row === null ? null : storage.toPublicGame(row);
+  }
+
+  /**
+   * Refuse a game this player is hosting that nobody has joined.
+   *
+   * An open game is a claim on a seat: hosting a second one, or queueing for a different
+   * opponent while one sits in the lobby, would leave the first listed with a host who
+   * has stopped watching it.
+   */
+  function requireNoOpenGame(userId) {
+    const open = storage.findOpenGameHostedBy(database, userId);
+    if (open !== null) {
+      throw httpError(409, 'already_hosting',
+        `you are already hosting game ${Number(open.id)} — cancel it or wait for an opponent`);
+    }
+  }
+
+  /** The game id from a parameterised route. The pattern already guaranteed digits. */
+  function gameIdOf(ctx) {
+    return Number(ctx.params.id);
+  }
+
+  function lobbyState(ctx) {
+    const user = requireUser(ctx.req);
+    return { status: 200, body: lobby.payload(user.id) };
+  }
+
+  /**
+   * The event stream. Everything after this line is written by lobby.js, which is why
+   * this is the one handler that does not return a response.
+   */
+  function stream(ctx) {
+    const user = requireUser(ctx.req);
+    lobby.openStream(ctx.res, user);
+    return RESPONSE_TAKEN;
+  }
+
+  /**
+   * Host a game.
+   *
+   * Everything between the check and the insert is synchronous, and so is storage, so two
+   * requests from the same player cannot both find "no open game there" — which is what
+   * "at most one open game" rests on. That is a property of one process and a
+   * single-threaded database, not of the check itself; a second replica would need the
+   * partial unique index this deliberately does not have.
+   */
+  function hostGame(ctx) {
+    const user = requireUser(ctx.req);
+    requireNoOpenGame(user.id);
+
+    const createdAt = now();
+    const id = storage.insertGame(database, {
+      seed: null,
+      hostId: user.id,
+      guestId: null,
+      status: storage.GAME_OPEN,
+      createdAt,
+      startedAt: null
+    });
+
+    const game = storage.toPublicGame(storage.findGameById(database, id));
+    logger.info(`game ${game.id} hosted by user ${user.id}`);
+    lobby.broadcastLobby();
+    return { status: 201, body: { game } };
+  }
+
+  /**
+   * Join an open game: fill the empty seat, issue the seed, tell both players.
+   *
+   * The seed is made here and not sent by the client, so neither player can pick a map
+   * they have practised. Ownership is checked before status, so a host who tries to join
+   * their own game is told that rather than "already started".
+   */
+  function joinGame(ctx) {
+    const user = requireUser(ctx.req);
+    const id = gameIdOf(ctx);
+
+    const row = storage.findGameById(database, id);
+    if (row === null) throw httpError(404, 'no_such_game', 'that game is no longer in the lobby');
+    if (Number(row.host_id) === user.id) throw httpError(409, 'own_game', 'you are hosting this game');
+    if (row.status !== storage.GAME_OPEN) throw httpError(409, 'game_not_open', 'that game has already started');
+    requireNoOpenGame(user.id);
+
+    const seed = makeSeed();
+    if (!storage.claimGame(database, id, user.id, seed, now())) {
+      // Lost the race for the seat: the WHERE in claimGame is what decided it.
+      throw httpError(409, 'game_not_open', 'that game has already started');
+    }
+
+    const game = storage.toPublicGame(storage.findGameById(database, id));
+    logger.info(`game ${game.id} started, hosted by user ${game.host.id}, joined by user ${user.id}`);
+    lobby.notifyMatch(game);
+    lobby.broadcastLobby();
+    return { status: 200, body: { game } };
+  }
+
+  /** Cancel an open game. Only its host, and only while nobody has joined. */
+  function cancelGame(ctx) {
+    const user = requireUser(ctx.req);
+    const id = gameIdOf(ctx);
+
+    const row = storage.findGameById(database, id);
+    if (row === null) throw httpError(404, 'no_such_game', 'no such game');
+    if (Number(row.host_id) !== user.id) throw httpError(403, 'not_your_game', 'only the host can cancel a game');
+    if (row.status !== storage.GAME_OPEN) throw httpError(409, 'game_not_open', 'that game has already started');
+
+    storage.deleteGame(database, id);
+    logger.info(`game ${id} cancelled by user ${user.id}`);
+    lobby.broadcastLobby();
+    return { status: 200, body: { ok: true, id } };
+  }
+
+  /**
+   * Details for a game, for one of its two players.
+   *
+   * 403 rather than 404 for everybody else: the game exists and the caller cannot have
+   * it. Nothing is hidden by saying so — the same game, minus the seat, is in every
+   * lobby list — and a 403 that means "not yours" is far easier to debug than a 404 that
+   * means two different things.
+   */
+  function gameDetails(ctx) {
+    const user = requireUser(ctx.req);
+    const row = storage.findGameById(database, gameIdOf(ctx));
+    if (row === null) throw httpError(404, 'no_such_game', 'no such game');
+
+    const participant = Number(row.host_id) === user.id
+      || (row.guest_id !== null && Number(row.guest_id) === user.id);
+    if (!participant) throw httpError(403, 'not_your_game', 'that game belongs to other players');
+
+    return { status: 200, body: { game: storage.toPublicGame(row) } };
+  }
+
+  /** The queue answer, in one shape whether the caller waited, matched or left. */
+  function queueState(userId, game) {
+    return {
+      waiting: lobby.isWaiting(userId),
+      queue: { count: lobby.waiterCount() },
+      game: game || liveGameFor(userId)
+    };
+  }
+
+  /**
+   * Enter the quick-match queue, pairing immediately when somebody is already waiting.
+   *
+   * Idempotent for a caller who is already in it: a second tab, or a client retrying,
+   * is told it is waiting rather than given an error for doing what it just did.
+   */
+  function enterQueue(ctx) {
+    const user = requireUser(ctx.req);
+    requireNoOpenGame(user.id);
+    if (lobby.isWaiting(user.id)) return { status: 200, body: queueState(user.id, null) };
+
+    const opponentId = lobby.takeWaiter(user.id);
+    if (opponentId === null) {
+      lobby.addWaiter(user.id);
+      lobby.send(user.id, 'queue', queueState(user.id, null));
+      lobby.broadcastLobby();
+      return { status: 200, body: queueState(user.id, null) };
+    }
+
+    // Whoever was already waiting hosts, so the pairing is deterministic and the seed is
+    // made here either way — neither player ever chooses it.
+    const startedAt = now();
+    const id = storage.insertGame(database, {
+      seed: makeSeed(),
+      hostId: opponentId,
+      guestId: user.id,
+      status: storage.GAME_PLAYING,
+      createdAt: startedAt,
+      startedAt
+    });
+
+    const game = storage.toPublicGame(storage.findGameById(database, id));
+    logger.info(`quick match: game ${game.id} between users ${game.host.id} and ${user.id}`);
+    lobby.notifyMatch(game);
+    lobby.broadcastLobby();
+    return { status: 200, body: queueState(user.id, game) };
+  }
+
+  /** Stop waiting. Idempotent: leaving a queue you are not in is already the goal. */
+  function leaveQueue(ctx) {
+    const user = requireUser(ctx.req);
+    if (lobby.removeWaiter(user.id)) {
+      lobby.send(user.id, 'queue', queueState(user.id, null));
+      lobby.broadcastLobby();
+    }
+    return { status: 200, body: queueState(user.id, null) };
+  }
+
   // -------------------------------------------------------------------- routing
 
   const routes = [
@@ -141,8 +350,30 @@ function createApi({ config, database, version, limiters, now = Date.now }) {
     { method: 'POST', path: '/api/auth/register', bucket: 'register', handler: register },
     { method: 'POST', path: '/api/auth/login', bucket: 'login', handler: login },
     { method: 'POST', path: '/api/auth/logout', bucket: null, handler: logout },
-    { method: 'GET', path: '/api/me', bucket: null, handler: me }
+    { method: 'GET', path: '/api/me', bucket: null, handler: me },
+    { method: 'GET', path: '/api/lobby', bucket: null, handler: lobbyState },
+    { method: 'GET', path: '/api/stream', bucket: null, handler: stream },
+    { method: 'POST', path: '/api/games', bucket: 'games', handler: hostGame },
+    { method: 'POST', path: '/api/games/:id/join', pattern: /^\/api\/games\/(\d+)\/join$/, bucket: null, handler: joinGame },
+    { method: 'POST', path: '/api/queue', bucket: 'queue', handler: enterQueue },
+    { method: 'DELETE', path: '/api/queue', bucket: null, handler: leaveQueue },
+    { method: 'GET', path: '/api/games/:id', pattern: /^\/api\/games\/(\d+)$/, bucket: null, handler: gameDetails },
+    { method: 'DELETE', path: '/api/games/:id', pattern: /^\/api\/games\/(\d+)$/, bucket: null, handler: cancelGame }
   ];
+
+  /**
+   * Whether a route serves a path, and what its parameters are: an object of them, or
+   * null when the path is somebody else's. Routes with a `path` and no `pattern` are
+   * exact matches, which is most of them; `/api/games/:id` owns a family of paths, and
+   * the digits-only pattern is what keeps `/api/games/abc` a 404 rather than a lookup
+   * with a string where an id belongs.
+   */
+  function matchRoute(route, pathname) {
+    if (route.path === pathname && !route.pattern) return {};
+    if (!route.pattern) return null;
+    const match = route.pattern.exec(pathname);
+    return match === null ? null : { id: match[1] };
+  }
 
   /** A handler failure turned into a response. Never leaks a stack, a query or a path. */
   function errorResponse(err) {
@@ -160,30 +391,32 @@ function createApi({ config, database, version, limiters, now = Date.now }) {
    * the caller never has to guard against this rejecting.
    */
   async function handle(req, res, url) {
-    const ctx = { req, res, now };
+    const matching = routes.filter((route) => matchRoute(route, url.pathname) !== null);
     let response;
     try {
-      const route = routes.find((candidate) => candidate.path === url.pathname);
-      if (!route) throw httpError(404, 'not_found', 'no such endpoint');
+      if (matching.length === 0) throw httpError(404, 'not_found', 'no such endpoint');
 
-      if (route.method !== req.method) {
+      const route = matching.find((candidate) => candidate.method === req.method);
+      if (!route) {
         // 405 with an Allow header rather than 404: the endpoint exists, the verb does
         // not fit it, and saying so is more useful than pretending otherwise. Still
         // JSON — nothing under /api/ ever answers with the client's HTML.
-        const allow = routes
-          .filter((candidate) => candidate.path === url.pathname)
-          .map((candidate) => candidate.method)
-          .join(', ');
+        const allow = matching.map((candidate) => candidate.method).join(', ');
         throw httpError(405, 'method_not_allowed', `${req.method} is not allowed on this endpoint`, { Allow: allow });
       }
 
       if (route.bucket) enforceRateLimit(route.bucket, req);
-      response = await route.handler(ctx);
+      response = await route.handler({ req, res, now, params: matchRoute(route, url.pathname) });
     } catch (err) {
       response = errorResponse(err);
     }
 
-    sendJson(res, response.status, response.body, response.headers);  }
+    // The one handler that owns its own socket from here on is the event stream, which
+    // has no end and so cannot be described by a status and a body.
+    if (response === RESPONSE_TAKEN) return;
+
+    sendJson(res, response.status, response.body, response.headers);
+  }
 
   return { handle, routes };
 }
