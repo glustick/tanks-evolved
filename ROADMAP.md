@@ -139,6 +139,44 @@ Worth deciding when it is picked up: whether the move is spent before aiming as 
 combined action or as its own step, whether the opponent sees the move as it happens or
 only the resulting board, and whether a tank can be driven somewhere it cannot shoot from.
 
+### Weapon pickups, dropped across the battlefield
+
+Requested. Seed the map with weapon crates that a tank drives over to collect, replacing
+whatever it is firing — rockets, lasers, grenades, mortars — dropped at random but
+**evenly**, so the layout does not hand one player the match.
+
+**This depends on tank movement** (the entry above). "Run over" needs a tank that can
+drive. Without it a pickup is only reachable by the accident of a shell landing on one, or
+by spawning underneath a tank, which is not the feature.
+
+**Fairness here is a layout problem, not a quantity problem.** The natural approach mirrors
+the drops about the map centre, so whatever sits on the left has an equal on the right and
+neither player starts closer to an advantage — the player spawns are already symmetric in
+spirit, 1234 units apart on the default seed. Mirroring positions is not sufficient by
+itself, though: a laser and a mortar are not equally strong, so equal-by-position still
+leaves whoever draws the better weapon ahead. Two ways out, and one should be chosen
+deliberately:
+
+- mirror the *type* too, so both sides get the same options and the match turns on who
+  uses them better — the most even, and the least varied;
+- or pair by tier, so each side gets one strong and one weak pickup at mirrored positions.
+
+Either way a pickup should be a limited resource — a few shots, or one — so collecting one
+opens a window rather than deciding the match.
+
+**Determinism.** Drops must come from the match seed like everything else, through a
+**new named stream** alongside the existing `terrain`, `spawn`, `wind` and `ridge`
+(`js/utils.js`). A new name is safe; drawing from an existing stream would shift that
+stream's output for every seed, invalidating the tuning table in the README and every
+stored replay. The weapon a tank is holding has to join `TE.game.stateHash()` next to its
+integrity, angle and power — otherwise two clients can hold different weapons and the hash
+will not notice, which is precisely the class of bug the hash exists to catch — and the
+drop layout wants a checksum there for the same reason the terrain has one.
+
+**Terrain.** A pickup rests on the surface, and the surface moves: a shell that blows the
+ground out from under one should drop it and settle it again. That is the falling and
+settling path the tanks already use, and this would be the third feature to want it.
+
 - Server-side simulation in a worker thread, so the state hash is authoritative
   rather than merely cross-checked — and so a desync can be resolved rather than only
   detected. The simulation core already loads headlessly in Node, so this is wiring
@@ -149,8 +187,8 @@ only the resulting board, and whether a tank can be driven somewhere it cannot s
 - Spectating, and chat in the lobby rather than only inside a match.
 - Rematch from the win screen against the same opponent.
 - Account management: change display name, change password, delete account.
-- Additional weapons and weather — the other systems Phase 0 deliberately left out,
-  once there is a reason and an audience for them.
+- Weather — the last system Phase 0 deliberately left out, and the only one of the
+  three still without a request behind it. (Weapons now have their own entry above.)
 - Ranked play.
 
 ## Deliberately out of scope
