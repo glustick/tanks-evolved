@@ -18,6 +18,8 @@ Opening the page from disk is unchanged: no server is looked for, nothing is req
 and the game goes straight to local hot-seat. Served over HTTP, the page finds the API on
 its own origin: signed out it offers an account, signed in it shows the lobby.
 
+See [ROADMAP.md](ROADMAP.md) for what has shipped and what is next.
+
 ## Phase 0 scope
 
 In: two static tanks on seed-derived terrain, turn-based aiming, gravity + wind +
