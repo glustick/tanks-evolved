@@ -85,6 +85,47 @@ phase cheap, and it is the shape everything below has.
 
 ## Next
 
+### A post-apocalyptic pass, and real cover between the tanks
+
+Requested for the next session. Two halves that look similar and are not: how the
+battlefield reads, and what a shell can actually hit. They carry very different risk, and
+the first is the safe one.
+
+**The look is renderer-only and must stay outside the simulation.** Today the backdrop is
+a night sky — a three-stop blue gradient, a fixed star field, and two parallax ridge
+layers from `derive(seed, 'ridge')` in `js/render.js`. A post-apocalyptic pass means a
+different palette (ash, dust, a low burnt-orange horizon), a ruined skyline where the
+ridges are, wreckage and dead trees on the ground, debris and haze in the air. All of that
+is scenery, and it has to be drawn from a **new named stream** — never from `terrain`,
+`spawn`, `wind` or `ridge`, because those four feed the simulation. Changing what an
+existing stream produces would alter the battle for every existing seed, and invalidate
+the tuning table and every stored replay with it; a new stream cannot. The renderer
+already sets the precedent: the star field uses its own fixed
+`fromSeed('tanks-evolved-stars')` and the effects layer uses `'fx-visual'`.
+
+**The cover is gameplay, and it changes the hash.** `detectImpact` in `js/physics.js`
+resolves a shell against tanks, then terrain, then "lost". Solid cover is a fourth case,
+and that means three things follow from it:
+
+- placement from a **new named stream**, mirrored, so neither player gets the better
+  position — the same fairness rule the weapon pickups need;
+- a checksum over the layout in `TE.game.stateHash()`, following the pattern
+  `TE.terrain.checksum()` already sets. Without it two clients can disagree about the
+  cover and the hash will report agreement;
+- a decision on destructibility. Static cover is simpler and makes the geometry part of
+  the map; destructible cover behaves like terrain and has to enter the replay log the way
+  craters already do, which is the more interesting of the two and the more expensive.
+
+**Two constraints to settle before building it.** A shell must have a way through: the
+measured range table gives 45° at full power about 1557 units and the tanks spawn 900 to
+1400 apart, so cover placed carelessly between them makes a match unwinnable rather than
+interesting — the placement rule needs a guaranteed firing line, or a height below the
+apex of a full-power arc. And `pickSpawnX` currently takes the flattest of twelve seeded
+candidates, which will need to avoid dropping a tank inside a wall as well.
+
+Both halves land together, because cover is what makes the terrain read as a place rather
+than a curve — but they are separate commits, and the barrier one carries the risk.
+
 ### Hardening before this faces the internet
 
 Every item below is known rather than hypothetical, and is recorded here so it is not
