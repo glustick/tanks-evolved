@@ -1,0 +1,26 @@
+# Keeps the build context down to the files the image actually serves. The COPYs in
+# the Dockerfile name those paths explicitly, so nothing here is load-bearing for the
+# image contents — the point is not shipping the rest of the repo to the daemon, and
+# making a future `COPY . .` not silently drag tools/ and the git history into an HTTP
+# root.
+
+# Version control and this file's own history: the checkout is not the artifact.
+.git
+.gitignore
+
+# CI runs from the checkout, not from the image.
+.github
+
+# The Node suites and the headless-browser checks. Nothing at runtime reads them, and
+# inside the image they would sit in the served document root, downloadable at the
+# same URLs as the game.
+tools/
+
+# Repo documentation, not site content.
+README.md
+
+# This file and the compose file are inputs to the build, not outputs of it.
+docker-compose.yml
+
+# macOS noise.
+.DS_Store

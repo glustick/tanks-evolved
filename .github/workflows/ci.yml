@@ -1,0 +1,239 @@
+name: CI
+
+# The project is a static site with no build step and no dependencies, so CI is four
+# independent questions with four different answers: does the simulation still behave
+# (Node), does the page still boot in a real browser (Chrome), does the artifact we
+# would actually ship serve the game (Docker), and — only once all three say yes — can
+# it be published for the host that runs it (GHCR). Nothing is installed anywhere;
+# every check below runs as-is, which is the whole point of the repo having no
+# dependencies.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Every path here is relative to the repository root, which *is* the tanks-evolved/
+# directory — this workflow file is at its top level — so no job needs a
+# working-directory and the tools resolve their own paths from __dirname.
+
+jobs:
+  suite:
+    name: node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    # The runtime this is developed against and the next LTS. The tools are plain Node
+    # scripts, and a version difference between them is exactly the kind of thing that
+    # would otherwise only show up on someone else's machine.
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Simulation core (9 checks)
+        run: node tools/check-determinism.js
+
+      - name: Static constraints (6 checks)
+        run: node tools/check-static.js
+
+  browser:
+    name: browser checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 22 rather than the matrix above: tools/check-ui.js needs the global WebSocket
+      # that landed in Node 22, and both browser tools are testing the page rather than
+      # the runtime, so a second Node version would only double the job's duration.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Resolve the runner's Chrome
+        run: |
+          # ubuntu-latest ships Chrome (and sometimes Chromium beside it). Both tools
+          # take the binary through CHROME, so it is resolved once here rather than
+          # letting each one guess: a runner image that dropped the browser fails at
+          # this step, loudly, instead of turning the checks below into silent no-ops.
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable \
+            || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "::error::no Chrome/Chromium on this runner; the browser checks cannot run"
+            exit 1
+          fi
+          echo "using $CHROME_BIN ($("$CHROME_BIN" --version))"
+          echo "CHROME=$CHROME_BIN" >> "$GITHUB_ENV"
+
+      - name: Load the page, run the in-page self-test, drive the UI
+        run: |
+          # Both tools exit 2 when they cannot find a browser, and bash reports that as
+          # an ordinary failure — which is how a "browser" job goes green without a
+          # browser ever starting. Exit 2 gets its own message so it can never be read
+          # as a benign skip.
+          run_check() {
+            local label="$1"; shift
+            local rc=0
+            "$@" || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::$label found no browser (exit 2); this job cannot pass without a real one"
+              return 1
+            fi
+            return "$rc"
+          }
+
+          run_check headless-check.sh ./tools/headless-check.sh
+          run_check check-ui.js node tools/check-ui.js
+
+  docker:
+    name: docker image + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t tanks-evolved:ci .
+
+      - name: Serve it and check what comes back
+        run: |
+          set -euo pipefail
+
+          # 8099 on the host bound to loopback: a port nothing else on the runner is
+          # using, and one that cannot be answered by anything but this container.
+          docker run -d --name tanks-evolved-ci -p 127.0.0.1:8099:8080 tanks-evolved:ci
+
+          # nginx is listening a moment after the container starts, so poll for the
+          # first response instead of sleeping a fixed amount and hoping.
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8099/; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::the container never answered on :8099"
+            exit 1
+          fi
+
+          body="$(mktemp)"
+
+          # A 200 alone proves nothing — a static host will happily return 200 for the
+          # wrong page, or for a directory listing. Assert the markup the game boots
+          # from, which is the difference between "the container is up" and "the
+          # container is serving this game".
+          status="$(curl -sS -o "$body" -w '%{http_code}' http://127.0.0.1:8099/)"
+          echo "GET /               -> $status"
+          if [ "$status" != "200" ]; then
+            echo "::error::GET / returned $status, expected 200"
+            exit 1
+          fi
+          if ! grep -q 'id="stage"' "$body"; then
+            echo "::error::GET / returned 200 but not the game markup (no #stage canvas)"
+            exit 1
+          fi
+          echo "  matched: $(grep -o '<canvas id="stage"[^>]*>' "$body" | head -1)"
+          echo "  matched: $(grep -o 'id="version-tag">[^<]*' "$body" | head -1)"
+
+          # The MIME types are a config choice worth pinning down: a stylesheet served as
+          # text/plain is a broken page that still answers 200.
+          css_type="$(curl -sS -o /dev/null -w '%{content_type}' http://127.0.0.1:8099/css/style.css)"
+          echo "GET /css/style.css  -> $css_type"
+          case "$css_type" in
+            text/css*) ;;
+            *) echo "::error::stylesheet served as $css_type"; exit 1 ;;
+          esac
+
+          js_type="$(curl -sS -o /dev/null -w '%{content_type}' http://127.0.0.1:8099/js/game.js)"
+          echo "GET /js/game.js     -> $js_type"
+          case "$js_type" in
+            *javascript*) ;;
+            *) echo "::error::script served as $js_type"; exit 1 ;;
+          esac
+
+          # Unknown paths are sent to the shell on purpose (see nginx.conf): that is the
+          # difference between a mistyped URL landing on the game and landing on a bare
+          # 404 page with nothing on it.
+          miss_status="$(curl -sS -o "$body" -w '%{http_code}' http://127.0.0.1:8099/no/such/path)"
+          echo "GET /no/such/path   -> $miss_status"
+          if [ "$miss_status" != "200" ] || ! grep -q 'id="stage"' "$body"; then
+            echo "::error::an unknown path did not fall back to the game shell"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: docker logs tanks-evolved-ci || true
+
+      # Always, so a failed step above does not leave the container holding :8099 for
+      # whatever runs next on this runner.
+      - name: Tear down
+        if: always()
+        run: docker rm -f tanks-evolved-ci || true
+
+  # The only job that writes outside this repository, so it is gated twice over: it
+  # never runs for a pull request, and it waits on all three checks above. The image
+  # is what the Dockhand host actually runs, so a test failure must not be able to
+  # publish over a working deployment.
+  publish:
+    name: publish image
+    runs-on: ubuntu-latest
+    needs: [suite, browser, docker]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # GITHUB_TOKEN is enough: it is scoped to this run and expires with it, so
+      # there is no long-lived registry secret to rotate or leak.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${{ github.repository }}"
+          SHORT="$(git rev-parse --short HEAD)"
+          # One source of truth for the version — the same RELEASE_VERSION the HUD
+          # shows and ./publish.sh reads, so a pushed tag cannot drift from the page.
+          VERSION="$(sed -n "s/.*RELEASE_VERSION *= *'\([0-9][0-9.]*\)'.*/\1/p" js/version.js | head -1)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read RELEASE_VERSION from js/version.js"
+            exit 1
+          fi
+
+          TAGS=("latest" "sha-$SHORT" "$VERSION")
+          # A v* tag push also publishes the tag itself, which is what a pinned
+          # deployment would reference.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAGS+=("${{ github.ref_name }}")
+          fi
+
+          ARGS=()
+          for t in "${TAGS[@]}"; do ARGS+=(-t "$IMAGE:$t"); done
+
+          docker build "${ARGS[@]}" .
+
+          for t in "${TAGS[@]}"; do
+            echo "pushing $IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+
+          {
+            echo "### Published image"
+            echo
+            echo "\`$IMAGE\`"
+            echo
+            for t in "${TAGS[@]}"; do echo "- \`$IMAGE:$t\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

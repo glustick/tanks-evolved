@@ -1,0 +1,35 @@
+# Local run: `docker compose up --build`, then http://localhost:8080
+#
+# There is no published image for this project, so `build:` is the only way in and
+# `image:` is set purely so the result has a stable name instead of an anonymous build
+# id. Everything below is the same image `docker run -p 8080:8080 tanks-evolved` runs.
+
+services:
+  web:
+    build: .
+    image: tanks-evolved:local
+    restart: unless-stopped
+    ports:
+      # Host 8080 onto the container's 8080 (see nginx.conf — the container listens on
+      # an unprivileged port because it does not run as root). Only one container can
+      # hold this port, so change the left-hand side if something else already has it.
+      - "8080:8080"
+
+    # --- Hardening ---------------------------------------------------------------------
+    # The image already runs as the unprivileged nginx user, so these are the
+    # container-level settings worth keeping alongside it. Both are only safe because
+    # of that: nginx writes its pid file and its temp directories under /tmp and
+    # /var/cache/nginx (see nginx.conf), so those are the only two paths that need to
+    # be writable and everything else can be read-only.
+    read_only: true
+    tmpfs:
+      - /tmp
+      # The mode is not optional here. A tmpfs mount replaces the directory, so it
+      # also replaces the `chown -R nginx:nginx /var/cache/nginx` done in the
+      # Dockerfile — without mode=1777 the mount comes up owned by root and the master
+      # process dies at startup on `mkdir() "/var/cache/nginx/client_temp" failed
+      # (13: Permission denied)`. Nothing is ever written here (the site is GET-only),
+      # but nginx creates the directories on the way up and treats failure as fatal.
+      - /var/cache/nginx:mode=1777
+    security_opt:
+      - no-new-privileges:true

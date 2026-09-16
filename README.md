@@ -56,6 +56,11 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `tools/check-static.js` | Static constraint checks (assets exist, no modules/fetch/CDN, DOM id contract). |
 | `tools/headless-check.sh` | Loads the page in headless Chrome twice and fails on console errors. |
 | `tools/check-ui.js` | End-to-end UI test over the DevTools protocol: real clicks, drags, win screen, rematch. |
+| `Dockerfile` | Single-stage `nginx:1.30-alpine` image: these static files, an unprivileged port, no build step. |
+| `nginx.conf` | MIME types, cache headers, gzip and the `try_files` fallback — the whole server config. |
+| `docker-compose.yml` | Local run on `:8080`, with a read-only root filesystem and tmpfs for nginx's writable paths. |
+| `.dockerignore` | Keeps `tools/`, `README.md` and the git history out of the build context and the image. |
+| `.github/workflows/ci.yml` | CI: the two Node suites, the browser checks, and a container smoke test. |
 
 ## Determinism
 
@@ -126,6 +131,58 @@ occurs during the session. Add `--shots <dir>` to also write
 
 The self-test also prints its full report to the browser console and sets the page
 title to `SELFTEST PASS` / `SELFTEST FAIL`, so it can be run by hand in any browser.
+
+## Docker
+
+The site is static, so the image is just `nginx:1.30-alpine` with this directory copied
+into its document root. No build stage and no Node in the image — the visitor's browser
+is what runs the JS.
+
+```bash
+docker build -t tanks-evolved .
+docker run --rm -p 8080:8080 tanks-evolved      # → http://localhost:8080
+```
+
+Or with compose, which builds the same image and adds a read-only root filesystem:
+
+```bash
+docker compose up --build                       # → http://localhost:8080
+```
+
+| Detail | Value |
+| --- | --- |
+| Port in the container | `8080`, unprivileged — the image runs as the `nginx` user |
+| Host port | `-p <any>:8080` with `docker run`; compose publishes `8080` |
+| `index.html` | `Cache-Control: no-cache` — revalidated, so a deploy is picked up |
+| `css/`, `js/` | `Cache-Control: public, max-age=3600`, for the reason in `nginx.conf` |
+| Unknown paths | served the game shell via `try_files`, not a bare 404 |
+
+`tools/` and `README.md` are left out of the image deliberately: nothing at runtime
+reads them, and the document root is served over HTTP, so copying `tools/` would publish
+the test harness at the same URLs as the game.
+
+## CI
+
+`.github/workflows/ci.yml` runs on pushes to `main`, on every pull request, and on
+`workflow_dispatch`. Four jobs, nothing installed in any of them:
+
+| Job | Node | What it runs |
+| --- | --- | --- |
+| `suite` | `22` and `24` | `node tools/check-determinism.js`, then `node tools/check-static.js` |
+| `browser` | `22` | `tools/headless-check.sh`, then `node tools/check-ui.js`, against the runner's Chrome |
+| `docker` | — | `docker build`, then `curl` the running container for real game markup |
+| `publish` | — | Builds and pushes `ghcr.io/<owner>/tanks-evolved` — **only** on `main` or a `v*` tag, and only after the three checks above pass |
+
+The browser job resolves `google-chrome`/`chromium` on the runner and passes the path
+through `CHROME`. Both tools exit `2` when they cannot find a browser, and CI turns that
+exit code into a failed step rather than a skip: a "browser" job that never started a
+browser is not evidence of anything.
+
+The publish job tags the image `latest`, `sha-<short>` and the `RELEASE_VERSION` from
+`js/version.js`, plus the git tag itself on a `v*` push, and authenticates with the
+run-scoped `GITHUB_TOKEN` — no long-lived registry secret. GHCR creates a new package
+**private**; the first time it publishes, set the package to public once in the repo's
+package settings, and every later push stays public.
 
 ## Tuning
 
