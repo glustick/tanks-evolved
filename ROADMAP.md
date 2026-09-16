@@ -105,6 +105,40 @@ outside the network.
 
 Ideas that are not scheduled. Ordered roughly by how much they would add.
 
+### Tank movement, with action points each turn
+
+Requested. Give each tank a budget of action points every turn and let the player spend
+them driving forward or backward across the terrain, then aim and fire with what is left
+of the turn.
+
+*Why it matters:* the tanks are static, so a bad position is permanent and a match comes
+down to aim alone. Being able to reposition — to climb out of a crater, to drop behind a
+ridge, to close or open the range — is the missing half of the tactics, and it is what
+would make the destructible terrain matter to movement and not only to damage.
+
+**The part to get right first is the relay.** The whole netcode rests on a turn being a
+small set of numbers both machines can replay, and today that set is
+`(seed, playerIndex, angle, power)`: `js/game.js` fires from it, the shot row in
+`server/lib/db.js` stores it, and `POST /api/games/:id/shot` carries it. Movement makes
+that `(…, move)` — and `move` has to travel the same path and land in the same row. If a
+client moves without telling the server, the two boards diverge and the match is reported
+as a desync that neither player caused; storing it in the log is also what keeps reconnect
+working, since rebuilding from a reload is a replay of that log.
+
+Movement should go through the existing simulation rather than being applied as a
+teleport. The tank state already models ground support, falling and fall damage, and
+`js/tanks.js` says so in its header — "tanks are static in Phase 0: no driving, no fuel,
+they do fall when a shell removes the ground beneath them". Driving off a ledge should
+drop the tank and cost it integrity, exactly as a crater edge does now, so "the ground
+under a tank changed" stays one code path instead of two.
+
+Reverses a Phase 0 decision: tank movement was listed as deliberately out of scope, in
+`js/tanks.js` and in the README's Phase 0 scope.
+
+Worth deciding when it is picked up: whether the move is spent before aiming as one
+combined action or as its own step, whether the opponent sees the move as it happens or
+only the resulting board, and whether a tank can be driven somewhere it cannot shoot from.
+
 - Server-side simulation in a worker thread, so the state hash is authoritative
   rather than merely cross-checked — and so a desync can be resolved rather than only
   detected. The simulation core already loads headlessly in Node, so this is wiring
@@ -115,8 +149,8 @@ Ideas that are not scheduled. Ordered roughly by how much they would add.
 - Spectating, and chat in the lobby rather than only inside a match.
 - Rematch from the win screen against the same opponent.
 - Account management: change display name, change password, delete account.
-- Additional weapons, tank movement and weather — the systems Phase 0 deliberately
-  left out once there is a reason and an audience for them.
+- Additional weapons and weather — the other systems Phase 0 deliberately left out,
+  once there is a reason and an audience for them.
 - Ranked play.
 
 ## Deliberately out of scope
