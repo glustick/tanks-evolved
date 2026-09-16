@@ -125,7 +125,20 @@
     cancel: function (id) { return request('DELETE', gamePath(id)); },
     game: function (id) { return request('GET', gamePath(id)); },
     queue: function () { return request('POST', PATHS.queue); },
-    leaveQueue: function () { return request('DELETE', PATHS.queue); }
+    leaveQueue: function () { return request('DELETE', PATHS.queue); },
+
+    // The match. A shot is three numbers and a fingerprint: the aim to replay, and the
+    // board the sender was looking at when it fired. The server relays the first two and
+    // compares the third, which is all it can do without simulating anything.
+    shot: function (id, angle, power, stateHash) {
+      return request('POST', gamePath(id) + '/shot', { angle: angle, power: power, stateHash: stateHash });
+    },
+    chat: function (id, text) { return request('POST', gamePath(id) + '/chat', { text: text }); },
+    // The outcome, from this client's point of view. Two reports that agree is what ends
+    // a match; see js/match.js for why both players send one.
+    reportResult: function (id, winnerUserId, stateHash) {
+      return request('POST', gamePath(id) + '/result', { winnerUserId: winnerUserId, stateHash: stateHash });
+    }
   };
 
   // -------------------------------------------------------------- event stream
@@ -162,12 +175,23 @@
         handlers.onEvent(name, data);
       });
     }
-    // The four names the server sends. Anything else on this stream is an event from a
-    // newer server, which this client ignores by not listening for it.
+    // Every name the server sends. Anything else on this stream is an event from a newer
+    // server, which this client ignores by not listening for it.
     listen('hello');
     listen('lobby');
     listen('queue');
     listen('match');
+    // The match: the board and the chat, and the whole state after anything about them
+    // changes. `game` is the one a client resyncs from — `shot`, `turn`, `over` and
+    // `desync` all arrive with a `game` beside them, so nothing has to be inferred from
+    // having seen the others.
+    listen('game');
+    listen('shot');
+    listen('chat');
+    listen('turn');
+    listen('over');
+    listen('desync');
+    listen('opponent');
 
     source.addEventListener('open', function () { handlers.onStatus('live'); });
     source.addEventListener('error', function () {
@@ -199,6 +223,9 @@
     cancel: api.cancel,
     game: api.game,
     queue: api.queue,
-    leaveQueue: api.leaveQueue
+    leaveQueue: api.leaveQueue,
+    shot: api.shot,
+    chat: api.chat,
+    reportResult: api.reportResult
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

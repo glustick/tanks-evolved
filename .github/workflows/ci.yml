@@ -1,12 +1,12 @@
 name: CI
 
-# The project is a static client plus a zero-dependency server, so CI is five
-# independent questions: does the simulation still behave (Node), does the page still
-# boot in a real browser (Chrome), does the artifact we would actually ship serve the
-# game (Docker), do accounts, sessions and the lobby still work (the server suites), and
-# — only once everything says yes — can the images be published for the host that runs
-# them (GHCR). Nothing is installed anywhere; every check below runs as-is, which is the
-# whole point of the repo having no dependencies.
+  # The project is a static client plus a zero-dependency server, so CI is five
+  # independent questions: does the simulation still behave (Node), does the page still
+  # boot in a real browser (Chrome), does the artifact we would actually ship serve the
+  # game (Docker), do accounts, sessions, the lobby and a networked match still work (the
+  # server suites), and — only once everything says yes — can the images be published for
+  # the host that runs them (GHCR). Nothing is installed anywhere; every check below runs
+  # as-is, which is the whole point of the repo having no dependencies.
 
 on:
   push:
@@ -187,17 +187,22 @@ jobs:
         with:
           node-version: "24"
 
-      # Two suites, one process shape: each spawns the real server on an ephemeral port
+      # Three suites, one process shape: each spawns the real server on an ephemeral port
       # against a database in a temporary directory. The lobby suite also measures time —
       # a dropped stream is expected to clean up after a few hundred milliseconds of
       # configured grace — so it is given the runner's whole step rather than a timeout
-      # tuned for a laptop.
+      # tuned for a laptop. The match suite loads the simulation in a `vm` for two players
+      # and plays a complete match through the API, so it is the slowest of the three.
       - name: Accounts, sessions and storage (20 checks)
         run: node server/test/auth.test.js
 
       - name: Lobby, matchmaking and the event stream (21 checks)
         run: node server/test/lobby.test.js
         timeout-minutes: 5
+
+      - name: The networked match (16 checks)
+        run: node server/test/match.test.js
+        timeout-minutes: 10
 
   # The only job that writes outside this repository, so it is gated twice over: it
   # never runs for a pull request, and it waits on every check above. The image is what

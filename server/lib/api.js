@@ -1,6 +1,6 @@
 /**
- * api.js — the JSON surface: the Phase 1 account endpoints and the Phase 2 lobby, plus
- * the rules that apply to all of them.
+ * api.js — the JSON surface: the Phase 1 account endpoints, the Phase 2 lobby and the
+ * Phase 3 match, plus the rules that apply to all of them.
  *
  * Every handler is a plain function returning a description of the response, and the
  * dispatcher below is the only place that writes one. That keeps the cookie flags, the
@@ -11,11 +11,17 @@
  *
  * The HTTP rules live here and the bookkeeping lives in lobby.js: this file decides what
  * a 409 means, that module decides who is connected and who is waiting.
+ *
+ * Nothing in this file simulates. A shot is relayed and its hash recorded, never
+ * replayed and never judged: the two clients are the only things that know what the
+ * world looks like, and the server's whole contribution to "are they in step" is to
+ * compare what they say. That is a property worth stating plainly, because it is the
+ * reason the endpoints here are so short.
  */
 'use strict';
 
 const { httpError, isHttpError, readJsonBody, sendJson, clientIp, RESPONSE_TAKEN } = require('./http');
-const { requireEmail, requirePassword } = require('./validate');
+const { requireEmail, requirePassword, requireShot, requireMessage, requireWinner, requireStateHash } = require('./validate');
 const passwords = require('./passwords');
 const sessions = require('./sessions');
 const { makeSeed } = require('./lobby');
@@ -49,9 +55,16 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
    * full. Counted before the body is read or validated: an attempt is an attempt, and a
    * limiter that only counted well-formed ones would let an attacker send unlimited
    * malformed traffic (and unlimited scrypt work) for free.
+   *
+   * `subject` overrides what the count is keyed by. The endpoints that anybody can reach
+   * leave it out and are keyed by address, which is the only identity that exists before
+   * a session does; the endpoints inside a match pass the player's id, because what they
+   * bound is one player flooding a room rather than one address making requests — see
+   * ratelimit.js.
    */
-  function enforceRateLimit(bucketName, req) {
-    const result = limiters[bucketName].check(clientIp(req));
+  function enforceRateLimit(bucketName, req, subject) {
+    const key = subject === undefined ? clientIp(req) : subject;
+    const result = limiters[bucketName].check(key);
     if (!result.allowed) {
       throw httpError(429, 'rate_limited', 'too many attempts — please wait and try again',
         { 'Retry-After': String(result.retryAfterSeconds) });
@@ -273,17 +286,168 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
    * it. Nothing is hidden by saying so — the same game, minus the seat, is in every
    * lobby list — and a 403 that means "not yours" is far easier to debug than a 404 that
    * means two different things.
+   *
+   * Finished games are readable too, and that is deliberate: the payload is the whole
+   * match — the replay log and the chat as well as the row — so a client that reloaded
+   * after the last shot can still rebuild the board it is about to be shown the result of.
    */
   function gameDetails(ctx) {
     const user = requireUser(ctx.req);
-    const row = storage.findGameById(database, gameIdOf(ctx));
+    requireParticipant(user, gameIdOf(ctx), null);
+    return { status: 200, body: lobby.gameState(gameIdOf(ctx)) };
+  }
+
+  // --------------------------------------------------------------------- match
+
+  /**
+   * The game behind an id, provided the caller is in it and it is in the state they
+   * think it is. Every match endpoint starts here.
+   *
+   * The id is looked up once and both facts are checked against the row that came back,
+   * so a game that was cancelled, swept or finished between the two can never be acted
+   * on. `expectedStatus` is the state the caller needs rather than the state they will
+   * get: a shot needs a game that is being played, and reading one needs anything.
+   */
+  function requireParticipant(user, id, expectedStatus) {
+    const row = storage.findGameById(database, id);
     if (row === null) throw httpError(404, 'no_such_game', 'no such game');
 
     const participant = Number(row.host_id) === user.id
       || (row.guest_id !== null && Number(row.guest_id) === user.id);
     if (!participant) throw httpError(403, 'not_your_game', 'that game belongs to other players');
 
-    return { status: 200, body: { game: storage.toPublicGame(row) } };
+    if (expectedStatus !== null && row.status !== expectedStatus) {
+      // Every state that is not 'playing' is worth telling apart by name — finished, in
+      // particular, is a match a client should stop sending shots into rather than a
+      // match that cannot be found.
+      throw httpError(409, 'game_not_playing', row.status === storage.GAME_FINISHED
+        ? 'that match has finished'
+        : 'that game has not started yet');
+    }
+    return row;
+  }
+
+  /**
+   * Take a shot.
+   *
+   * Three things are checked, and none of them is about the shot's quality because the
+   * server cannot judge that: it is not the client that decides whose turn it is (the
+   * shot count does), it is not the client that decides whether this turn has been
+   * played (the UNIQUE index does), and the aim is bounds-checked so that what is stored
+   * is what both clients will fire rather than what each of them clamps to.
+   *
+   * The response is the whole match state, so a client that lost its stream between
+   * firing and being told what happened is answered rather than left guessing.
+   */
+  async function submitShot(ctx) {
+    const user = requireUser(ctx.req);
+    const id = gameIdOf(ctx);
+    const row = requireParticipant(user, id, storage.GAME_PLAYING);
+    enforceRateLimit('shots', ctx.req, `u${user.id}`);
+
+    const body = await readJsonBody(ctx.req, config.bodyLimitBytes);
+    const { angle, power, stateHash } = requireShot(body);
+
+    const game = storage.toPublicGame(row);
+    const turn = storage.listShots(database, id).length + 1;
+    if (storage.activeUserIdFor(game, turn) !== user.id) {
+      throw httpError(409, 'not_your_turn', `it is turn ${turn} and it is not yours`);
+    }
+
+    const createdAt = now();
+    const inserted = storage.insertShot(database, {
+      gameId: id, turn, userId: user.id, angle, power, stateHash, createdAt
+    });
+    // The index, not the check above: two requests for one turn can only both reach here
+    // from the same player, and this is where the second one loses.
+    if (inserted === null) throw httpError(409, 'turn_played', `turn ${turn} has already been played`);
+
+    const shot = storage.toPublicShot({
+      turn, user_id: user.id, angle, power, state_hash: stateHash, created_at: createdAt
+    });
+    logger.info(`game ${id} turn ${turn}: shot by user ${user.id} at ${angle}° / ${power}%`);
+    lobby.notifyShot(id, shot);
+
+    return { status: 201, body: lobby.gameState(id) };
+  }
+
+  /** Say something to the opponent. Stored, then broadcast, so a rejoin sees the history. */
+  async function postChat(ctx) {
+    const user = requireUser(ctx.req);
+    const id = gameIdOf(ctx);
+    requireParticipant(user, id, storage.GAME_PLAYING);
+    enforceRateLimit('chat', ctx.req, `u${user.id}`);
+
+    const body = await readJsonBody(ctx.req, config.bodyLimitBytes);
+    const text = requireMessage(body);
+
+    const createdAt = now();
+    storage.insertMessage(database, { gameId: id, userId: user.id, body: text, createdAt });
+    const message = storage.toPublicMessage({ user_id: user.id, body: text, created_at: createdAt });
+    lobby.notifyChat(id, message);
+
+    // The message, not the match: the sender already has everything else, and the chat
+    // event carrying the same object is what the receiving client renders from. One
+    // shape, one render path, whichever of the two a client happens to see first.
+    return { status: 201, body: { message } };
+  }
+
+  /**
+   * Report who won, and finish the match when both players have said the same thing.
+   *
+   * This is the only place the server has an opinion about the outcome, and the opinion
+   * is "these two accounts agree". It cannot check a result and does not try: it did not
+   * simulate the match, so the two clients' accounts of it are all there is — which is
+   * exactly why one of them alone is not enough. A disagreement, in the winner or in the
+   * board hash, is a desync: the match ends with nobody's name on it, and both clients
+   * are told what happened rather than one of them being handed a victory the other
+   * denies.
+   *
+   * A report is a claim about a board that is still on screen, so it is answered rather
+   * than remembered: the client that reports first is told it is waiting, and the one
+   * that reports second gets the verdict.
+   */
+  async function reportResult(ctx) {
+    const user = requireUser(ctx.req);
+    const id = gameIdOf(ctx);
+    const row = requireParticipant(user, id, storage.GAME_PLAYING);
+
+    const body = await readJsonBody(ctx.req, config.bodyLimitBytes);
+    const winnerId = requireWinner(body, storage.toPublicGame(row));
+    const stateHash = requireStateHash(body);
+
+    const verdict = lobby.recordResult(id, user.id, { winnerId, stateHash });
+    if (verdict.status === 'conflict') {
+      // The same player, a different answer. Accepting it would make "both agree" a
+      // statement about the last thing either of them said rather than about the match.
+      throw httpError(409, 'already_reported', 'you have already reported a different result');
+    }
+
+    if (verdict.status !== 'waiting' && verdict.status !== 'repeat') {
+      const desync = verdict.status === 'desync';
+      if (!storage.finishGame(database, id, desync ? null : winnerId, now(), desync)) {
+        // A late report that lost a race with the sweep, or a second report from the
+        // other player after the match was already finished by the walkover.
+        lobby.forgetResult(id);
+        throw httpError(409, 'game_not_playing', 'that match has already finished');
+      }
+      logger.info(desync
+        ? `game ${id} ended in a desync: the two clients reported different results`
+        : `game ${id} won by user ${winnerId}${winnerId === null ? ' (draw)' : ''}`);
+      // notifyOver forgets the two reports: every ending goes through it.
+      lobby.notifyOver(id, desync ? 'desync' : 'result');
+    }
+
+    const state = lobby.gameState(id);
+    return {
+      status: 200,
+      body: {
+        agreed: verdict.status === 'agreed',
+        waiting: verdict.status === 'waiting' || verdict.status === 'repeat',
+        desync: state.game.desync,
+        game: state.game
+      }
+    };
   }
 
   /** The queue answer, in one shape whether the caller waited, matched or left. */
@@ -355,6 +519,9 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
     { method: 'GET', path: '/api/stream', bucket: null, handler: stream },
     { method: 'POST', path: '/api/games', bucket: 'games', handler: hostGame },
     { method: 'POST', path: '/api/games/:id/join', pattern: /^\/api\/games\/(\d+)\/join$/, bucket: null, handler: joinGame },
+    { method: 'POST', path: '/api/games/:id/shot', pattern: /^\/api\/games\/(\d+)\/shot$/, bucket: null, handler: submitShot },
+    { method: 'POST', path: '/api/games/:id/chat', pattern: /^\/api\/games\/(\d+)\/chat$/, bucket: null, handler: postChat },
+    { method: 'POST', path: '/api/games/:id/result', pattern: /^\/api\/games\/(\d+)\/result$/, bucket: null, handler: reportResult },
     { method: 'POST', path: '/api/queue', bucket: 'queue', handler: enterQueue },
     { method: 'DELETE', path: '/api/queue', bucket: null, handler: leaveQueue },
     { method: 'GET', path: '/api/games/:id', pattern: /^\/api\/games\/(\d+)$/, bucket: null, handler: gameDetails },

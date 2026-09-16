@@ -1,5 +1,5 @@
 /**
- * db.js — the whole persistence layer: one SQLite file, three tables, and the handful of
+ * db.js — the whole persistence layer: one SQLite file, five tables, and the handful of
  * statements the API needs.
  *
  * node:sqlite is synchronous, which is the right shape here. These are index lookups
@@ -61,24 +61,71 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
 
   -- A game is one row for its whole life: open (hosted, waiting for an opponent),
-  -- playing (both players known, seed issued), and nothing else yet — Phase 3 ends a
-  -- match, and 'finished' arrives with it.
+  -- playing (both players known, seed issued) and finished (ended, with or without a
+  -- winner). A NULL winner_id on a finished game means a draw or a desync, and the desync
+  -- flag says which.
   CREATE TABLE IF NOT EXISTS games (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     -- NULL until somebody joins. The seed is issued by the server at that moment and
     -- by nobody else, which is what makes it trustworthy as a shared map.
-    seed       TEXT,
-    host_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    seed        TEXT,
+    host_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     -- NULL while the game is open, which is also how "is there an opponent" is read.
-    guest_id   INTEGER          REFERENCES users(id) ON DELETE CASCADE,
-    status     TEXT    NOT NULL,
-    created_at INTEGER NOT NULL,
-    started_at INTEGER
+    guest_id    INTEGER          REFERENCES users(id) ON DELETE CASCADE,
+    status      TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL,
+    started_at  INTEGER,
+    winner_id   INTEGER          REFERENCES users(id),
+    finished_at INTEGER,
+    -- Set when the two clients reported results that do not match. A boolean, stored the
+    -- way SQLite stores booleans, so a flag added by MIGRATIONS and one created here have
+    -- the same type.
+    desync      INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE INDEX IF NOT EXISTS idx_games_host_id ON games (host_id);
   CREATE INDEX IF NOT EXISTS idx_games_guest_id ON games (guest_id);
   CREATE INDEX IF NOT EXISTS idx_games_status ON games (status);
+
+  -- The replay log, and the whole reason a reloaded tab can rejoin a match in progress: a
+  -- shot is (angle, power) and the simulation is deterministic, so replaying these in turn
+  -- order from the same seed rebuilds exactly the board both players are looking at.
+  --
+  -- The hash stored with each one is the fingerprint of the world as that shot was fired.
+  -- It is not needed to replay — it is what lets a replay *check itself* at every turn
+  -- rather than only agreeing at the end, and what the two clients are compared on when
+  -- they report a result.
+  CREATE TABLE IF NOT EXISTS shots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    -- 1-based and dense: the shot count is what "whose turn is it" is derived from, so a
+    -- gap would change whose turn it is as well as losing a shot.
+    turn       INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    angle      REAL    NOT NULL,
+    power      REAL    NOT NULL,
+    state_hash TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  -- One shot per turn, enforced by the database rather than by a read-then-write: two
+  -- requests for the same turn both run the insert, exactly one changes a row, and the
+  -- other is told the turn is already played instead of quietly overwriting it or leaving
+  -- the replay log with two shots the same turn cannot replay.
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_shots_game_turn ON shots (game_id, turn);
+
+  -- In-match chat. Stored rather than relayed and forgotten because a reconnecting player
+  -- has to see what was said while they were gone, which is the same requirement the shot
+  -- log answers for the board.
+  CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_messages_game_id ON messages (game_id, id);
 `;
 
 /**
@@ -89,6 +136,10 @@ const SCHEMA = `
  * exists, and SQLite is never asked to create it. Each entry is therefore applied by
  * name — PRAGMA first, ALTER only if the column is absent — which is idempotent on both
  * the fresh and the deployed path, and is what keeps a deploy from being a flag day.
+ *
+ * `backfill` is optional: it is there for a column that has to have a sensible value for
+ * rows that already exist. A column that is meaningful only from now on, such as when a
+ * match ended, has nothing to say about rows written before it did.
  */
 const MIGRATIONS = [
   {
@@ -103,7 +154,15 @@ const MIGRATIONS = [
                                           THEN substr(email, 1, instr(email, '@') - 1)
                                           ELSE email END
                 WHERE display_name = '' OR display_name IS NULL`
-  }
+  },
+  // The three a match needs to be able to end. Deliberately no backfill: a game that was
+  // played before this deploy ended with nobody's name on it, and inventing a winner for
+  // it now would be worse than leaving it blank. Nor is there a REFERENCES clause on
+  // winner_id — the winner is a record of what happened, not a live relationship, and a
+  // cascade from users is the wrong direction for it.
+  { table: 'games', column: 'winner_id', add: 'ALTER TABLE games ADD COLUMN winner_id INTEGER' },
+  { table: 'games', column: 'finished_at', add: 'ALTER TABLE games ADD COLUMN finished_at INTEGER' },
+  { table: 'games', column: 'desync', add: 'ALTER TABLE games ADD COLUMN desync INTEGER NOT NULL DEFAULT 0' }
 ];
 
 /**
@@ -166,7 +225,7 @@ function applyMigrations(db) {
     const columns = db.prepare(`PRAGMA table_info(${migration.table})`).all().map((row) => row.name);
     if (columns.includes(migration.column)) continue;
     db.exec(migration.add);
-    db.exec(migration.backfill);
+    if (migration.backfill) db.exec(migration.backfill);
   }
 }
 
@@ -293,10 +352,11 @@ function toPublicPlayer(row) {
 
 // ---------------------------------------------------------------------- games
 
-// The two states a game can be in. Exported rather than spelled out at each call site
+// The three states a game can be in. Exported rather than spelled out at each call site
 // because they are compared in several places and a typo would read as "not open".
 const GAME_OPEN = 'open';
 const GAME_PLAYING = 'playing';
+const GAME_FINISHED = 'finished';
 
 /**
  * The row shape every game query returns: the game, plus the display name of each
@@ -306,14 +366,23 @@ const GAME_PLAYING = 'playing';
  */
 const GAME_COLUMNS = `
   SELECT g.id, g.seed, g.status, g.created_at, g.started_at,
+         g.winner_id, g.finished_at, g.desync,
          h.id AS host_id, h.display_name AS host_name,
-         u.id AS guest_id, u.display_name AS guest_name
+         u.id AS guest_id, u.display_name AS guest_name,
+         w.display_name AS winner_name
     FROM games g
     JOIN users h ON h.id = g.host_id
     LEFT JOIN users u ON u.id = g.guest_id
+    LEFT JOIN users w ON w.id = g.winner_id
 `;
 
-/** The public shape of a game. The only place a game becomes a response body. */
+/**
+ * The public shape of a game. The only place a game becomes a response body.
+ *
+ * `winner` is a player object rather than a bare id, for the same reason neither player
+ * is a bare id: the client has a name to render and nothing else to look an id up with.
+ * A finished game with no winner is a draw or a desync, and `desync` distinguishes them.
+ */
 function toPublicGame(row) {
   return {
     id: Number(row.id),
@@ -322,9 +391,28 @@ function toPublicGame(row) {
     createdAt: Number(row.created_at),
     startedAt: row.started_at === null ? null : Number(row.started_at),
     host: { id: Number(row.host_id), displayName: row.host_name },
-    guest: row.guest_id === null ? null : { id: Number(row.guest_id), displayName: row.guest_name }
+    guest: row.guest_id === null ? null : { id: Number(row.guest_id), displayName: row.guest_name },
+    winner: row.winner_id === null || row.winner_id === undefined
+      ? null
+      : { id: Number(row.winner_id), displayName: row.winner_name },
+    finishedAt: row.finished_at === null || row.finished_at === undefined ? null : Number(row.finished_at),
+    desync: Boolean(row.desync)
   };
 }
+
+/**
+ * Whose turn it is, from the shot count alone: the host plays odd turns.
+ *
+ * Derived rather than stored, which is the whole reason a shot cannot be sent out of
+ * turn — the server knows the answer without trusting anybody, and it cannot drift out of
+ * step with the replay log because it *is* the replay log. `turn` is 1-based, so it is
+ * always one more than the number of shots already played.
+ */
+function activeUserIdFor(game, turn) {
+  if (turn % 2 === 1) return game.host.id;
+  return game.guest === null ? null : game.guest.id;
+}
+
 
 function findGameById(db, id) {
   return db.prepare(`${GAME_COLUMNS} WHERE g.id = ?`).get(id) || null;
@@ -402,6 +490,99 @@ function deleteGames(db, ids) {
   return Number(db.prepare(`DELETE FROM games WHERE id IN (${placeholders})`).run(...ids).changes);
 }
 
+/**
+ * A player's live matches. Used by the presence bookkeeping, which has to tell the
+ * opponent of somebody who just went away — plural because a player is not stopped from
+ * being in more than one playing game, and one presence change concerns all of them.
+ */
+function listPlayingGamesForUser(db, userId) {
+  return db.prepare(`${GAME_COLUMNS} WHERE g.status = ? AND (g.host_id = ? OR g.guest_id = ?)`)
+    .all(GAME_PLAYING, userId, userId);
+}
+
+/**
+ * End a match, returning whether this call is the one that ended it.
+ *
+ * `status = 'playing'` in the WHERE clause is the concurrency control, the same shape as
+ * claimGame's: the two clients report their results independently, both calls run this
+ * UPDATE, and exactly one of them is told it was the one that finished the match — so a
+ * client can never be told twice, and a finished match can never be re-finished with a
+ * different winner by a late report.
+ */
+function finishGame(db, id, winnerId, finishedAt, desync) {
+  const info = db.prepare(
+    `UPDATE games SET status = ?, winner_id = ?, finished_at = ?, desync = ?
+      WHERE id = ? AND status = ?`
+  ).run(GAME_FINISHED, winnerId, finishedAt, desync ? 1 : 0, id, GAME_PLAYING);
+  return Number(info.changes) === 1;
+}
+
+// ---------------------------------------------------------------------- shots
+
+/**
+ * Append a shot to a game's replay log, returning null when that turn already has one.
+ *
+ * The UNIQUE index on (game_id, turn) is the authority on "once per turn", not a SELECT
+ * first: two requests from the same player for the same turn is the case this exists for,
+ * and a read-then-write would let both of them find the turn free.
+ */
+function insertShot(db, shot) {
+  try {
+    const info = db.prepare(
+      `INSERT INTO shots (game_id, turn, user_id, angle, power, state_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(shot.gameId, shot.turn, shot.userId, shot.angle, shot.power, shot.stateHash, shot.createdAt);
+    return Number(info.lastInsertRowid);
+  } catch (err) {
+    if (isUniqueViolation(err)) return null;
+    throw err;
+  }
+}
+
+/** A game's shots in turn order — the order they have to be replayed in. */
+function listShots(db, gameId) {
+  return db.prepare(
+    'SELECT turn, user_id, angle, power, state_hash, created_at FROM shots WHERE game_id = ? ORDER BY turn ASC'
+  ).all(gameId);
+}
+
+/**
+ * The public shape of a shot. `userId` rather than a name, unlike a player in a game:
+ * both players are already named once in the payload, and a shot is the same row to both
+ * of them.
+ */
+function toPublicShot(row) {
+  return {
+    turn: Number(row.turn),
+    userId: Number(row.user_id),
+    angle: Number(row.angle),
+    power: Number(row.power),
+    stateHash: String(row.state_hash),
+    createdAt: Number(row.created_at)
+  };
+}
+
+// ------------------------------------------------------------------- messages
+
+function insertMessage(db, message) {
+  const info = db.prepare(
+    'INSERT INTO messages (game_id, user_id, body, created_at) VALUES (?, ?, ?, ?)'
+  ).run(message.gameId, message.userId, message.body, message.createdAt);
+  return Number(info.lastInsertRowid);
+}
+
+/** Oldest first, which is the order a chat log is read in. */
+function listMessages(db, gameId) {
+  return db.prepare(
+    'SELECT user_id, body, created_at FROM messages WHERE game_id = ? ORDER BY id ASC'
+  ).all(gameId);
+}
+
+/** `text` rather than `body`, so the wire shape reads as prose rather than as a column. */
+function toPublicMessage(row) {
+  return { userId: Number(row.user_id), text: String(row.body), createdAt: Number(row.created_at) };
+}
+
 // ------------------------------------------------------------------- sessions
 
 function insertSession(db, session) {
@@ -465,7 +646,9 @@ module.exports = {
   isUniqueViolation,
   GAME_OPEN,
   GAME_PLAYING,
+  GAME_FINISHED,
   toPublicGame,
+  activeUserIdFor,
   findGameById,
   listOpenGames,
   findLiveGameForUser,
@@ -475,5 +658,13 @@ module.exports = {
   deleteGame,
   deleteOpenGamesHostedBy,
   listStaleGames,
-  deleteGames
+  listPlayingGamesForUser,
+  finishGame,
+  deleteGames,
+  insertShot,
+  listShots,
+  toPublicShot,
+  insertMessage,
+  listMessages,
+  toPublicMessage
 };

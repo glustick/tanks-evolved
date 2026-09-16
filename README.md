@@ -5,18 +5,19 @@ Earth*: two tanks trade arcing, wind-affected shells across a destructible
 landscape.
 
 The game is still a no-build static site that works from `file://` and plays local
-hot-seat. Alongside it, `server/` holds the account service and the lobby that networked
-play is being built on — see [Server](#server).
+hot-seat. Alongside it, `server/` holds the account service, the lobby, and the relay two
+players on different machines play a match through — see [Server](#server).
 
 ```
 open tanks-evolved/index.html          # works straight from disk (file://)
-node server/index.js                   # or with accounts and a lobby: http://127.0.0.1:8081
+node server/index.js                   # or online: accounts, the lobby, networked matches
 python3 -m http.server -d tanks-evolved 8000   # or any static host
 ```
 
 Opening the page from disk is unchanged: no server is looked for, nothing is requested,
 and the game goes straight to local hot-seat. Served over HTTP, the page finds the API on
-its own origin: signed out it offers an account, signed in it shows the lobby.
+its own origin: signed out it offers an account, signed in it shows the lobby, and a
+match puts both players on the same board.
 
 See [ROADMAP.md](ROADMAP.md) for what has shipped and what is next.
 
@@ -36,11 +37,26 @@ In: accounts with a display name, hosting a game, joining one, cancelling one, a
 quick-match queue, a live lobby pushed over Server-Sent Events, and the sign-in and
 lobby screens that reach all of it.
 
-Out (Phase 3): playing the networked match. A game is created and both players are given
-the same server-issued seed; the board is still the local one. There is also no way for a
-player to *leave* a game yet — cancelling only applies to a game nobody has joined — so a
-finished match is cleaned up by the abandonment sweep rather than by an endpoint.
+Out (Phase 3): playing the networked match, which is the next section.
 
+## Match scope (Phase 3)
+
+In: a game that is `playing` becomes a real match between the two players. Your turn aims
+and fires through the server; their turn locks the board and says who you are waiting
+for. The opponent's shot is applied through the same simulation, so both boards stay
+identical, and each one fingerprints what it has after every turn. In-match chat.
+Presence — connected or away — and a walkover if the other player never comes back. A
+match ends with a recorded winner, and both players return to the lobby. Reload the page
+mid-match and you rejoin it: the seed and the shot log *are* the board, so catching up is
+replaying them.
+
+What the server does **not** do is simulate. A shot is `(angle, power, stateHash)`: it is
+relayed, stored in the game's replay log and compared at the end. The two clients are the
+only things that know what the world looks like, and both of them report the result before
+it is accepted.
+
+Local hot-seat is unchanged. From `file://` nothing is requested, and the board, the seed
+box and the rematch keys work exactly as they always did.
 
 ## Controls
 
@@ -54,6 +70,7 @@ finished match is cleaned up by the abandonment sweep rather than by an endpoint
 | New map (new seed) | `N` | Seed chip → **New map** |
 | Mute | `M` | **Sound on/off** |
 | Set an exact seed | — | Type in the Seed box, press `Enter` or **Set** |
+| Chat (in a networked match) | — | The chat field in the match panel |
 
 The seed is always visible in the top bar and is the only source of randomness:
 same seed → same terrain, same tank placement, same wind sequence.
@@ -74,7 +91,8 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `js/game.js` | Match/turn state machine, craters + damage, wind per turn, win/rematch, app bootstrap. |
 | `js/audio.js` | Procedural WebAudio SFX (fire, explosion, armour hit, fanfare) and the ambient bed. |
 | `js/net.js` | The server from the browser: the `/api` calls over fetch, the SSE stream over EventSource, and the file:// guard that makes both opt-in. |
-| `js/screens.js` | The register / login and lobby screens, and the connection indicator — DOM only, no requests of its own. |
+| `js/screens.js` | The register / login and lobby screens, and the connection indicator — DOM only, no requests of its own. Hands a `playing` game to `js/match.js` and takes the board back when the match is over. |
+| `js/match.js` | The networked match: the turn lock, the shot relay, the replay that rebuilds a board from the seed and the shot log, the chat panel and the result. |
 | `js/selftest.js` | In-page assertion suite, run by opening `index.html#selftest`. |
 | `tools/check-determinism.js` | Node+`vm` determinism suite over the simulation core. |
 | `tools/check-static.js` | Static constraint checks (assets exist, no modules, no external URLs, same-origin requests, DOM id contract, load order). |
@@ -85,18 +103,22 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `docker-compose.yml` | Local run on `:8080`, with a read-only root filesystem and tmpfs for nginx's writable paths. |
 | `.dockerignore` | Keeps `tools/`, `README.md` and the git history out of the build context and the image. |
 | `server/index.js` | Server entry point: env → database → listen, plus signal and crash handling. |
-| `server/lib/` | The service itself: routing, static serving, scrypt passwords, cookie sessions, rate limiting, SQLite storage, and the lobby/SSE hub (`lobby.js`). |
+| `server/lib/` | The service itself: routing, static serving, scrypt passwords, cookie sessions, rate limiting, SQLite storage, and the realtime hub — the lobby, the match relay and presence (`lobby.js`). |
 | `server/test/auth.test.js` | 20-check auth suite over real HTTP against a spawned server, no dependencies. |
 | `server/test/lobby.test.js` | 21-check lobby suite: hosting, joining, the queue, the event stream, disconnect cleanup, rate limits, stream bounds. |
+| `server/test/match.test.js` | 16-check match suite: the shot relay, turn ownership, the replay log, chat, results and desyncs, rate limits and the walkover — plus a complete two-player match driven through the API by the real simulation. |
 | `server/Dockerfile` | `node:24-alpine`, unprivileged, healthchecked. Built from the repository root. |
 | `.github/workflows/ci.yml` | CI: the Node suites, the browser checks, the container smoke test, and image publication. |
 
 ## Server
 
-`server/` is the account service and the lobby that networked play is being built on: a
-zero-dependency Node 24 program using only `node:http`, `node:crypto` and `node:sqlite` —
-no `package.json`, no `node_modules`. It serves the client and the API from one origin,
-which is what keeps CORS and cross-site cookies out of the design entirely.
+`server/` is the account service, the lobby and the match relay: a zero-dependency Node 24
+program using only `node:http`, `node:crypto` and `node:sqlite` — no `package.json`, no
+`node_modules`. It serves the client and the API from one origin, which is what keeps CORS
+and cross-site cookies out of the design entirely.
+
+It does not simulate. A match is relayed shot by shot and cross-checked by fingerprint; the
+two browsers run the physics. See [The networked match](#the-networked-match).
 
 ```bash
 node server/index.js                              # http://127.0.0.1:8081
@@ -114,10 +136,13 @@ PORT=9000 TANKS_DB=/tmp/t.db node server/index.js # or point it somewhere else
 | `POST /api/games` | host a game (409 if you are already hosting one) |
 | `POST /api/games/:id/join` | join an open game: it becomes `playing` with a **server-issued seed**, and both players are notified |
 | `DELETE /api/games/:id` | the host cancels an open game |
-| `GET /api/games/:id` | a game, for its two players only (403 for anyone else) |
+| `GET /api/games/:id` | the whole match for its two players only: the game, the ordered `shots`, the `messages`, the `turn`, whose turn it is, and who is present (403 for anyone else) |
+| `POST /api/games/:id/shot` | `{ angle, power, stateHash }` → the next entry in the replay log, relayed to both players. Only the player whose turn it is, and only once per turn |
+| `POST /api/games/:id/chat` | `{ text }` → stored and broadcast; trimmed, capped at 500 characters, rate-limited per player |
+| `POST /api/games/:id/result` | `{ winnerUserId, stateHash }` → recorded; **both** players must report the same winner and the same board before the match is finished |
 | `POST /api/queue` | enter the quick-match queue, pairing immediately if somebody is waiting |
 | `DELETE /api/queue` | leave the queue |
-| `GET /api/stream` | Server-Sent Events: `hello` on connect, then `lobby`, `queue` and `match` |
+| `GET /api/stream` | Server-Sent Events: `hello` on connect, then `lobby`, `queue`, `match`, `game`, `shot`, `chat`, `turn`, `over`, `desync`, `opponent` |
 
 Anything else under `/api/` is a JSON 404, or a 405 with `Allow` for a known path with the
 wrong method. Every other path serves the client under the same rules as `nginx.conf`.
@@ -139,11 +164,25 @@ event the suite produces.
 ### The event stream
 
 `GET /api/stream` is authenticated by the session cookie and gives each connected user
-their own stream — several tabs are several streams, and all of them update. Four event
-names, each carrying a JSON body: `hello` (on connect, the same shape as `lobby`), `lobby`
-(whenever the open games or the queue depth change), `queue` (your own queue state) and
-`match` (a game you have been put into). A comment line every `TANKS_STREAM_KEEPALIVE_MS`
-keeps idle proxies from closing a quiet stream.
+their own stream — several tabs are several streams, and all of them update. Ten event
+names, each carrying a JSON body:
+
+| Event | Carries |
+| --- | --- |
+| `hello` | on connect: the same shape as `lobby` |
+| `lobby` | whenever the open games or the queue depth change |
+| `queue` | your own queue state |
+| `match` | a game you have been put into — the whole match, as below |
+| `game` | the whole match again, after anything about it changed |
+| `shot` | a shot to apply: `{ turn, userId, angle, power, stateHash }` |
+| `chat` | one message |
+| `turn` | whose turn it now is |
+| `over` | the match finished, with the winner and why (a report, or a walkover) |
+| `desync` | it finished without one, because the two clients disagreed |
+| `opponent` | the other player disconnected or came back |
+
+A comment line every `TANKS_STREAM_KEEPALIVE_MS` keeps idle proxies from closing a quiet
+stream.
 
 The cleanup story, because a dropped connection must not strand anyone:
 
@@ -151,12 +190,41 @@ The cleanup story, because a dropped connection must not strand anyone:
 | --- | --- |
 | Queue entry | removed, after a `TANKS_STREAM_GRACE_MS` grace period so a reconnect (which EventSource does by itself) keeps their place |
 | Open game they host | cancelled, for the same reason: an open game means "I am here, waiting for an opponent" |
-| A game already `playing` | left alone — a refresh or a tunnel must not concede a match — and swept instead once nobody in it has been connected for `TANKS_ABANDON_MS` |
+| A game already `playing` | left alone — a refresh or a tunnel must not concede a match. The player is marked **away** and their opponent is told; if they have not come back after `TANKS_ABANDON_MS` the match is awarded to the player who stayed |
 
-The sweep runs every `TANKS_SWEEP_MS`, which is what eventually ends a match that both
-players walked away from. Streams and the queue are in memory, so a restart clears them
-and every waiting client learns from its own reconnecting stream; games are rows, because
-a game has to outlive the browser tab that made it.
+A match both players walked away from is swept after the same window, which is the last
+resort for a row that would otherwise block whichever of them comes back. Streams, the
+queue and the two pending result reports are in memory, so a restart clears them and every
+waiting client learns from its own reconnecting stream; games, shots and chat are rows,
+because they have to outlive the tab that made them.
+
+### The networked match
+
+The server relays shots and compares fingerprints; it never simulates. A shot is
+`(seed, playerIndex, angle, power)`, the simulation is deterministic, so both machines
+already produce byte-identical results from the same inputs — the server's job is to be
+the shared log and the referee.
+
+```
+A aims ──POST shot {angle, power, stateHash}──▶ server stores turn N
+                                                ├─▶ A: shot event ─┐
+                                                └─▶ B: shot event ─┤ both apply it with the
+                                                                   │ same code, from the
+                                                                   ▼ same seed
+   both boards, fingerprints equal ────────▶ turn N+1, whose turn comes from the shot count
+```
+
+| Question | Where the answer comes from |
+| --- | --- |
+| Whose turn is it? | the server: `turn = shots.length + 1`, and the host plays odd turns. A shot from anyone else is a 409 |
+| Has this turn been played? | a UNIQUE index on `(game_id, turn)` in storage, behind a turn check that refuses it first |
+| Are the two boards the same? | each shot carries the hash of the board **as it was fired**; the opponent recomputes it before firing the same shot and compares, and both players report the final hash with the result — a disagreement in the winner *or* the board is recorded as a desync, not a victory |
+| Who won? | the two clients, and only if they agree. The server cannot check a result, so it requires both reports rather than taking one |
+| What happens if a client misses a shot? | it fetches the match again — one payload, the seed and the ordered log — and replays it. The same path as a reload, which is the same path as joining |
+
+Because the log *is* the board, a reconnecting client needs no snapshot: rejoin, resync
+after a dropped stream, and a fresh player all replay the same shots from the same seed
+through the same `TE.match.applyShot()`.
 
 ### Environment
 
@@ -172,20 +240,24 @@ a game has to outlive the browser tab that made it.
 | `TANKS_REGISTER_MAX` / `_WINDOW_MS` | 5 per 60 min | |
 | `TANKS_GAMES_MAX` / `_WINDOW_MS` | 20 per 10 min | |
 | `TANKS_QUEUE_MAX` / `_WINDOW_MS` | 30 per 5 min | |
+| `TANKS_SHOTS_MAX` / `_WINDOW_MS` | 120 per 5 min | per **player**, not per address: this bounds one player flooding a match, and a shared connection must not make two players share a budget |
+| `TANKS_CHAT_MAX` / `_WINDOW_MS` | 60 per 1 min | per player |
 | `TANKS_STREAM_KEEPALIVE_MS` | 20 s | SSE comment interval |
 | `TANKS_STREAM_GRACE_MS` | 15 s | reconnect window before cleanup |
-| `TANKS_ABANDON_MS` | 30 min | how long a game with nobody connected survives |
-| `TANKS_SWEEP_MS` | 60 s | how often abandoned games are looked for |
+| `TANKS_ABANDON_MS` | 30 min | how long a match survives with nobody connected, before it is a walkover |
+| `TANKS_SWEEP_MS` | 60 s | how often that is looked for |
 | `TANKS_MAX_STREAMS_PER_USER` | 8 | live event streams one account may hold — exceeding it is a JSON 503 rather than a dropped connection |
 
 **Not yet:** email verification, password reset, TLS termination, honouring
-`X-Forwarded-For`, and any way for a player to leave or finish a game. The per-IP limit
-currently treats every request arriving through a reverse proxy as one client, so that
-needs fixing before this is exposed publicly — see [Notes and known limits](#notes-and-known-limits).
+`X-Forwarded-For`, and match history (finished games and their logs are kept, but nothing
+reads them back). The per-IP limit currently treats every request arriving through a
+reverse proxy as one client, so that needs fixing before this is exposed publicly — see
+[Notes and known limits](#notes-and-known-limits).
 
 ```bash
 node server/test/auth.test.js     # 20 checks over real HTTP, no dependencies
 node server/test/lobby.test.js    # 21 checks: the lobby, the queue and the stream
+node server/test/match.test.js    # 16 checks: the relay, chat, results, presence — and a whole match
 ```
 
 ## Determinism
@@ -201,7 +273,9 @@ hidden. Visual effects use their own seeded stream and frame time; they never fe
 back into game state.
 
 `TE.game.stateHash(game)` fingerprints terrain, wind, turn, both tanks and the
-shell, and is what the browser self-test compares across two runs.
+shell, and is what the browser self-test compares across two runs — and what the two
+clients in a networked match compare after every turn, with the server storing each turn's
+value in the replay log so a replay can check itself rather than only agreeing at the end.
 
 ## Verification
 
@@ -273,14 +347,27 @@ occurs during the session. Add `--shots <dir>` to also write
 The self-test also prints its full report to the browser console and sets the page
 title to `SELFTEST PASS` / `SELFTEST FAIL`, so it can be run by hand in any browser.
 
-**4. The networked lobby, in the browser (by hand)**
+**4. A networked match, in the browser**
 
 `tools/check-ui.js` drives `file://`, deliberately: local hot-seat is the mode that must
-never break, and the browser checks are what prove it does not. The lobby is verified
-against a running server with two browser profiles (two players) — register, host, join,
-quick-match, the stream pushing a match into an already-open tab, and loading the
-server's seed onto the local board — plus a `curl` walkthrough across two cookie jars for
-the API itself. Both are described in the phase's report rather than wired into CI.
+never break, and the browser checks are what prove it does not — including that the board
+is *not* locked, which is the one thing the match could have broken.
+
+The networked path is verified with two real browser profiles against a running server,
+and the phase's report describes what was seen rather than wiring a two-browser harness
+into CI: register on both, host and join, play a match to a win with the same aim solver
+the suite uses, then reload one tab mid-match and watch it replay its way back into the
+same board. Every turn's `TE.game.stateHash()` is compared across the two browsers.
+
+```bash
+node server/index.js                              # then open it in two profiles
+# and in a third profile, as a spectator: GET /api/games/:id is a 403
+```
+
+That harness is deliberately not in the repository: it needs two Chrome profiles and a
+browser that is not the runner's, and the phase's real acceptance evidence is
+`server/test/match.test.js`, which drives the same journey through the API without a
+browser in the way.
 
 ## Docker
 
@@ -321,7 +408,7 @@ the test harness at the same URLs as the game.
 | `suite` | `22` and `24` | `node tools/check-determinism.js`, then `node tools/check-static.js` |
 | `browser` | `22` | `tools/headless-check.sh`, then `node tools/check-ui.js`, against the runner's Chrome |
 | `docker` | — | `docker build`, then `curl` the running container for real game markup |
-| `server` | `24` | `node server/test/auth.test.js`, then `node server/test/lobby.test.js` |
+| `server` | `24` | `node server/test/auth.test.js`, then `node server/test/lobby.test.js`, then `node server/test/match.test.js` |
 | `publish` | — | Builds and pushes both images — **only** on `main` or a `v*` tag, and only after every check above has passed |
 
 The browser job resolves `google-chrome`/`chromium` on the runner and passes the path
@@ -368,19 +455,33 @@ A shell removes a crater up to 34 units deep and 62 units wide; a direct hit cos
   404) and the client treats that as "no lobby here" rather than as a session. In both
   cases the board, the seed box and local hot-seat work exactly as before, and the
   status chip reads `OFFLINE` instead of `LIVE`.
+- **A networked match is only as live as its event stream.** Presence, the turn, the
+  relayed shots and the chat all arrive on the stream; a client whose stream is down
+  stops hearing about the match and only catches up when it reconnects (which EventSource
+  does by itself, and which triggers a refetch-and-replay). A player who never opened a
+  stream is not tracked as present or away at all — the client always opens one, so this
+  is a limit of the protocol rather than something a player can hit.
+- **The two boards are only guaranteed identical between turns.** A shell in flight is at
+  a slightly different frame on each machine, and `TE.game.stateHash()` includes the
+  shell, so the fingerprints differ mid-flight by design. Every comparison — the relayed
+  shot's own hash, the result both players report — is taken at a turn boundary.
 - **Before this is exposed to the public internet**, four things need attention:
   1. **Rate limiting is per socket address and does not read `X-Forwarded-For`.** Behind a
      reverse proxy every player shares one bucket, so one client can lock out everybody
      else; without a proxy it is fine, and it is also the only thing standing between an
      anonymous client and unlimited rows in `games`. It needs a trusted-proxy
-     configuration, not just an enabled header.
+     configuration, not just an enabled header. (Shots and chat are limited per player
+     instead, so the match itself is already keyed correctly.)
   2. **There is no TLS and no `Secure` cookie by default.** `TANKS_SECURE_COOKIES=1` is
      required behind HTTPS, and HTTP must not be exposed.
   3. **Nothing bounds the number of accounts or games beyond the rate limits.** A single
-     address can register 5 accounts an hour and host 20 games per 10 minutes, forever.
+     address can register 5 accounts an hour and host 20 games per 10 minutes, forever. A
+     finished game — its row, its shots and its chat — is kept indefinitely.
   4. **No email verification and no password reset**, so an address is never proven and a
      forgetful player is stuck. Accounts are also unauthenticated chaos-wise: a display
      name is not unique, so two players can look identical in the lobby list.
-- The queue and the event streams live in process memory, so this runs as **one replica**:
-  a second instance would have a queue nobody else can see. Horizontal scaling needs a
-  shared store (and sticky sessions for the streams) before it needs anything else.
+- The queue, the event streams and the two pending result reports live in process memory,
+  so this runs as **one replica**: a second instance would have a queue nobody else can see
+  and would refuse to finish a match the two players had already agreed on. Horizontal
+  scaling needs a shared store (and sticky sessions for the streams) before it needs
+  anything else.

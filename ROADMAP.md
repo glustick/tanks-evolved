@@ -36,24 +36,56 @@ game after a grace period, and an abandoned game is swept. On the client: regist
 and login screens, the lobby, and a connection chip. Local `file://` play is
 untouched — `js/net.js` issues nothing at all unless the protocol is http(s).
 
-## Next
-
 ### Phase 3 — the networked match
 
-The part that makes it multiplayer, and the only phase where two people play each
-other rather than their own board.
+Two players on different machines, one game, turn by turn. The server **still never
+simulates**: a shot is `(seed, playerIndex, angle, power)` and the simulation is
+deterministic, so the server relays the aim and stores a fingerprint while both clients
+run the same physics from the same seed. That one property is what makes the rest of the
+phase cheap, and it is the shape everything below has.
 
-- [ ] Turn relay. The active player's `(angle, power)` goes to the server and out to
-      the opponent, so both machines simulate the same shot from the same seed.
-- [ ] `stateHash` agreement after each turn. The server compares both clients' hashes
-      and flags a desync, instead of letting two boards quietly diverge.
-- [ ] Turn ownership. Aiming is locked when it is not your turn.
-- [ ] In-game text chat between the two players.
-- [ ] A match can end: the winner is recorded and both clients return to the lobby.
-- [ ] Reconnect. Reload the page mid-match and rejoin the game in progress.
-- [ ] Retire "Load this map locally", which exists only because there is no relay yet.
+- Turn relay. `POST /api/games/:id/shot` takes `{ angle, power, stateHash }`, stores it as
+  the next entry in the game's replay log, relays it to both players and advances the turn.
+- Turn ownership. The server derives whose turn it is from the shot count — the host plays
+  odd turns — and refuses anything else with a 409. The client locks the board to match:
+  aiming, firing, the seed box and the rematch keys all refuse while it is not your turn.
+- `stateHash` agreement. Each shot carries the fingerprint of the board **as it was fired**,
+  the opponent recomputes it before firing the same shot, and the receiver compares the two
+  (js/match.js). When both players report a result, the server requires the same winner
+  *and* the same final hash; a disagreement in either is recorded as a desync instead of a
+  victory. The server does not compare hashes turn by turn — it cannot, it never simulates —
+  so per-turn equality rests on the two clients checking each other, and the server's part
+  is the comparison at the end. Making the hash authoritative server-side is a `Later` item.
+- In-match text chat, stored and broadcast, trimmed and length-capped, rate-limited per
+  player, and returned with the game so a reconnecting player sees what was said.
+- A match can end. The winner is recorded, both players report it, and both are returned to
+  the lobby — the lobby opens behind the result overlay, which is left on screen with the
+  answer and a way back, so nobody is shown a lobby instead of a score. A finished game
+  stops being a live one, so neither player is stranded in it.
+- Presence. A player whose last stream closes is marked away and their opponent is told; if
+  they do not come back within the abandonment window the match is a *walkover* for the
+  player who stayed, which is what finally lets a game reach a terminal state without
+  either client inventing one. Presence is the event stream, so a player with no stream at
+  all is not tracked as away — the client always opens one.
+- Reconnect, and recovery. A reload mid-match refetches the game and replays the seed plus
+  the ordered shot log through the same simulation, arriving at the board the other player
+  is on. The same path — fetch the match, replay the log — is what a client falls back on
+  when it has reason to think it is behind: a shot whose answer never came back, or a
+  stream that dropped between two turns. The aim being lined up is carried across that
+  rebuild, because it is the one piece of the board that is in no log and belongs to
+  neither the server nor the opponent.
+- "Load this map locally" is gone: it existed only because there was no relay.
+- Verified by `server/test/match.test.js`, whose last check drives the real simulation in
+  Node for two players — including js/match.js itself — through a complete match over HTTP,
+  asserting identical `stateHash` after every turn, agreement with the stored value, an
+  accepted winner, and a third "reconnecting" client that rebuilds the same final hash from
+  the seed and the shot log alone. The client's half was driven in two real browsers (two
+  profiles against a running server) for a whole match, a mid-match reload, and a board
+  deliberately knocked out of step; that harness was temporary and is not in the repository.
 
-## Hardening before this faces the internet
+## Next
+
+### Hardening before this faces the internet
 
 Every item below is known rather than hypothetical, and is recorded here so it is not
 rediscovered later. All of it must be closed before the service is reachable from
@@ -63,10 +95,10 @@ outside the network.
 | - | ----- | -------------- |
 | 1 | Rate limits ignore `X-Forwarded-For` | Behind a reverse proxy every player shares one bucket, so one client can lock out logins, registration, hosting and queueing for everyone. It is also the only bound on row creation. |
 | 2 | No TLS, and `Secure` cookies are opt-in | Session cookies travel in clear over plain HTTP. |
-| 3 | The queue and every stream live in process memory | Single replica only. A restart drops queue places, and a second instance would show a different queue. |
+| 3 | The queue, every stream, and both pending result reports live in process memory | Single replica only. A restart drops queue places and a half-finished result, and a second instance would show a different queue and refuse to finish a match the two players had already agreed on. |
 | 4 | No email verification, no password reset | Nothing proves an address, and a locked-out player has no way back in. |
 | 5 | Display names are not unique | Two accounts can look identical in the lobby list. |
-| 6 | No cap on total games per account | A player who never returns leaves rows behind for up to the abandonment window. |
+| 6 | No cap on total games per account | A player who never returns leaves rows behind for up to the abandonment window. A finished game is kept forever, with its shots and chat. |
 | 7 | CSRF rests on `SameSite=Lax` alone | Sound while every state change is a POST on one origin — and lost the moment the API moves to another host or a state-changing `GET` appears. |
 
 ## Later
@@ -74,9 +106,11 @@ outside the network.
 Ideas that are not scheduled. Ordered roughly by how much they would add.
 
 - Server-side simulation in a worker thread, so the state hash is authoritative
-  rather than merely cross-checked. The simulation core already loads headlessly in
-  Node, so this is wiring rather than new physics.
-- Match end conditions beyond last-tank-standing, and a match history.
+  rather than merely cross-checked — and so a desync can be resolved rather than only
+  detected. The simulation core already loads headlessly in Node, so this is wiring
+  rather than new physics.
+- Match end conditions beyond last-tank-standing, and a match history drawn from the
+  finished games and their replay logs that the database now keeps.
 - An AI opponent, and a practice mode against it.
 - Spectating, and chat in the lobby rather than only inside a match.
 - Rematch from the win screen against the same opponent.

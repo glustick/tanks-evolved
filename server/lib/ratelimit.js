@@ -1,5 +1,5 @@
 /**
- * ratelimit.js — a fixed-window counter per bucket, keyed by client address.
+ * ratelimit.js — a fixed-window counter per bucket, keyed by whoever the caller says.
  *
  * In-memory and per-process, on purpose: there is one process, one client-facing port,
  * and no shared store available to reach for without a dependency. The trade-offs are
@@ -10,6 +10,13 @@
  * The window is fixed rather than sliding: the worst case is a client sending `max` at
  * the end of one window and `max` at the start of the next, which for a login endpoint
  * is not a meaningful difference.
+ *
+ * The key is the caller's choice because the two kinds of limit answer two different
+ * questions. An endpoint that anybody can reach is limited per address — that is the
+ * only identity available before a session exists. An endpoint inside a match is limited
+ * per *player*, because what it bounds is one player flooding a room, and one address is
+ * not one player: a shared connection would otherwise make two players share a budget
+ * and let one of them spend it for both.
  */
 'use strict';
 
@@ -66,7 +73,9 @@ function createLimiters(rateLimit) {
     login: createBucket(rateLimit.login),
     register: createBucket(rateLimit.register),
     games: createBucket(rateLimit.games),
-    queue: createBucket(rateLimit.queue)
+    queue: createBucket(rateLimit.queue),
+    shots: createBucket(rateLimit.shots),
+    chat: createBucket(rateLimit.chat)
   };
 }
 

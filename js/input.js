@@ -9,6 +9,11 @@
  * This file is the only place that knows about the game's element ids, and
  * `REQUIRED_IDS` is exported so the self-test can assert the markup still
  * matches the code. The lobby screens keep their own list, in screens.js.
+ *
+ * The board can be *locked* — setLock() — which is how a networked match stops this
+ * player from aiming the tank that is not theirs, firing out of turn, or rebuilding the
+ * map underneath both of them. Locking is refusal at the three routes above rather than
+ * a hidden button, because every one of them is a way onto the board.
  */
 (function (root) {
   'use strict';
@@ -111,6 +116,21 @@
     // Cache of the last values written to the DOM, so refresh() only touches
     // the DOM when something actually changed.
     var cache = {};
+
+    /**
+     * Why the board is not this player's to touch, or null when it is.
+     *
+     * A networked match locks the board whenever it is not that player's turn, because
+     * the two tanks are not equally local any more: aiming the opponent's tank would
+     * change a world two machines are supposed to agree on, and firing out of turn would
+     * advance a turn the other player is still looking at. The lock is the client's half
+     * of a rule the server enforces on its own, and it lives here rather than in the match
+     * because this file is the only one that knows how the board is operated.
+     */
+    var lock = null;
+
+    /** Overridable: a networked match routes Fire through the server instead of firing. */
+    var fireHandler = opts.onFire || null;
     var drag = null;
     var listeners = [];
 
@@ -146,7 +166,37 @@
       return game.world.tanks[game.world.activeIndex];
     }
 
+    /**
+     * Hold or release the board. The reason string is for the caller's own bookkeeping
+     * and for the status line; nothing here renders it.
+     */
+    function setLock(reason) {
+      var next = reason == null ? null : String(reason);
+      if (next === lock) return lock;
+      lock = next;
+      // Whatever was on screen described the old lock, so the next refresh has to repaint
+      // rather than decide nothing changed.
+      cache.canFire = null;
+      cache.locked = null;
+      refresh(true);
+      return lock;
+    }
+
+    /**
+     * Take over the Fire button.
+     *
+     * A networked match cannot fire locally: the shot has to be the server's to relay, and
+     * the board has to move only once it has been. Everything else about firing — the
+     * gesture, the refresh, the sound — stays here, because this is still the code that
+     * knows how the board is operated.
+     */
+    function setFireHandler(handler) {
+      fireHandler = typeof handler === 'function' ? handler : null;
+      return fireHandler;
+    }
+
     function applyAngle(value, announce) {
+      if (lock) return;
       var tank = activeTank();
       TE.tank.setAngle(tank, value);
       if (announce && audio && audio.click) audio.click();
@@ -154,12 +204,15 @@
     }
 
     function applyPower(value) {
+      if (lock) return;
       TE.tank.setPower(activeTank(), value);
       refresh(true);
     }
 
     function fire() {
       gesture();
+      if (lock) return;
+      if (fireHandler) { fireHandler(); return; }
       if (TE.game.fire(game)) refresh(true);
     }
 
@@ -183,6 +236,11 @@
       if (TE.screens && TE.screens.isOpen && TE.screens.isOpen()) return;
       var focused = doc && doc.activeElement;
       if (isTextEntry(focused)) return;
+
+      // A locked board still answers to mute and to Escape: those are about the page
+      // rather than about the match, and a player whose board is locked to somebody
+      // else's move must still be able to turn the sound off.
+      if (lock && key !== 'm' && key !== 'M' && key !== 'Escape') return;
 
       switch (key) {
         case 'ArrowLeft': case 'a': case 'A':
@@ -222,6 +280,7 @@
 
     function onPointerDown(ev) {
       unlockAudio(ev);
+      if (lock) return;
       if (game.world.state !== 'aiming') return;
       if (isModalOpen()) return;
       drag = canvasPoint(ev);
@@ -271,7 +330,16 @@
       return muted;
     }
 
+    /**
+     * Put a seed on the board and start a fresh match on it.
+     *
+     * Refused while the board is locked, and that is the whole of "a networked match
+     * cannot be reset locally": rebuild the board from a seed mid-match and this client
+     * is playing a different game from its opponent, with the same turn number and no
+     * way for either of them to tell.
+     */
     function applySeed(raw, announce) {
+      if (lock) return game.world.seed;
       var seed = normaliseSeed(raw);
       if (els['seed-input']) els['seed-input'].value = seed;
       gesture();
@@ -392,13 +460,20 @@
       }
 
       // Fire button availability + active player's accent colour.
-      var canFire = world.state === 'aiming' && !world.winner;
+      var canFire = world.state === 'aiming' && !world.winner && !lock;
       if (cache.canFire !== canFire || force) {
         if (els['fire-btn']) {
           els['fire-btn'].disabled = !canFire;
           setClass(els['fire-btn'], 'is-ready', canFire);
         }
         cache.canFire = canFire;
+      }
+      // A locked board says so on the controls themselves rather than only in the match
+      // panel: a slider that silently does nothing reads as a bug.
+      if (cache.locked !== lock || force) {
+        if (els['angle-slider']) els['angle-slider'].disabled = Boolean(lock);
+        if (els['power-slider']) els['power-slider'].disabled = Boolean(lock);
+        cache.locked = lock;
       }
       if (cache.firePlayer !== active.id) {
         setClass(els['fire-btn'], 'is-p2', active.id === 2);
@@ -454,7 +529,10 @@
       newMap: newMap,
       toggleMute: toggleMute,
       isModalOpen: isModalOpen,
-      closeModal: closeModal
+      closeModal: closeModal,
+      setLock: setLock,
+      setFireHandler: setFireHandler,
+      locked: function () { return lock; }
     };
 
     controller.boot();

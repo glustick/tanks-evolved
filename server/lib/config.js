@@ -44,6 +44,14 @@ const DEFAULTS = {
   gamesWindowMs: 10 * MINUTE,
   queueMax: 30,
   queueWindowMs: 5 * MINUTE,
+  // A match is one shot per turn, so this is not a gameplay limit at all: a real match
+  // sends a handful per minute, and the budget is what stops a client that has stopped
+  // playing the game from filling the replay log one row per request. Chat is the same
+  // question with a looser answer, because a player typing quickly is still playing.
+  shotsMax: 120,
+  shotsWindowMs: 5 * MINUTE,
+  chatMax: 60,
+  chatWindowMs: MINUTE,
   // The SSE keepalive. Short enough that an idle proxy does not close a quiet stream
   // (nginx's proxy_read_timeout defaults to 60s), long enough to be free: the same tick
   // also sweeps abandoned games.
@@ -130,6 +138,14 @@ function loadConfig(env = process.env) {
       queue: {
         max: integer(env, 'TANKS_QUEUE_MAX', DEFAULTS.queueMax, 1, 10000, warnings),
         windowMs: integer(env, 'TANKS_QUEUE_WINDOW_MS', DEFAULTS.queueWindowMs, 1000, 24 * 60 * MINUTE, warnings)
+      },
+      shots: {
+        max: integer(env, 'TANKS_SHOTS_MAX', DEFAULTS.shotsMax, 1, 100000, warnings),
+        windowMs: integer(env, 'TANKS_SHOTS_WINDOW_MS', DEFAULTS.shotsWindowMs, 1000, 24 * 60 * MINUTE, warnings)
+      },
+      chat: {
+        max: integer(env, 'TANKS_CHAT_MAX', DEFAULTS.chatMax, 1, 100000, warnings),
+        windowMs: integer(env, 'TANKS_CHAT_WINDOW_MS', DEFAULTS.chatWindowMs, 1000, 24 * 60 * MINUTE, warnings)
       }
     },
     streamKeepaliveMs: integer(env, 'TANKS_STREAM_KEEPALIVE_MS', DEFAULTS.streamKeepaliveMs, 1000, 10 * MINUTE, warnings),

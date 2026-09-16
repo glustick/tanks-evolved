@@ -235,6 +235,34 @@
   }
 
   /**
+   * Run the simulation until the shot in flight has resolved and control has been handed
+   * on — the flight, the impact and the settling, with no wall clock involved.
+   *
+   * This exists for the one caller that cannot wait: a client rejoining a match in
+   * progress has a log of shots to catch up on and no interest in watching them, and it
+   * has to arrive at byte-identical state to the player who did watch them. Driving the
+   * same fixed step directly, with the accumulator cleared each frame, is exactly what
+   * the frame loop would have done — the accumulator only decides *when* steps happen,
+   * never what they are.
+   *
+   * @param {object} game
+   * @param {number} [step] seconds per frame; the display loop's usual 1/60
+   * @param {number} [maxFrames] guard against a shot that never resolves
+   * @returns {number} how many frames it took
+   */
+  function settle(game, step, maxFrames) {
+    var dt = step || 1 / 60;
+    var limit = maxFrames || 6000;
+    var frames = 0;
+    while (game.world.state === 'flying' || game.world.state === 'settling') {
+      game.fixedAcc = 0;
+      update(game, dt);
+      if (++frames >= limit) break;
+    }
+    return frames;
+  }
+
+  /**
    * Stable fingerprint of everything that affects the outcome. The self-test
    * compares two runs of the same seed and expects identical hashes.
    */
@@ -399,6 +427,7 @@
     reset: reset,
     fire: fire,
     update: update,
+    settle: settle,
     stateHash: stateHash,
     resolveImpact: resolveImpact,
     finishTurn: finishTurn,

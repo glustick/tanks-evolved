@@ -1,5 +1,5 @@
 /**
- * screens.js — the register / login screen and the lobby, over the top of the game.
+ * screens.js — the register / login screen, the lobby, and the hand-off to a match.
  *
  * Three things this file is careful about:
  *
@@ -12,6 +12,10 @@
  *  - **The stream is the truth.** Buttons send a request and then render the answer; the
  *    event stream renders the same payload shape whenever anything changes, including
  *    changes made from another tab or by another player. One render path, two sources.
+ *
+ * A *playing* game is not rendered here at all. This file decides that a match has begun
+ * and hands the whole payload to js/match.js, which owns the board, the turn lock and the
+ * chat from that point on — and hands it back when the match is over.
  *
  * The only element ids this file touches are in REQUIRED_IDS, and tools/check-static.js
  * asserts they all exist in index.html — the same contract input.js has for the HUD.
@@ -29,7 +33,7 @@
     'lobby-screen', 'lobby-who', 'lobby-error', 'logout-btn', 'lobby-local',
     'lobby-count', 'lobby-games', 'lobby-empty', 'lobby-refresh',
     'host-btn', 'queue-btn', 'queue-state',
-    'my-game', 'my-game-title', 'my-game-meta', 'my-game-load', 'my-game-cancel'
+    'my-game', 'my-game-title', 'my-game-meta', 'my-game-cancel'
   ];
 
   /** How the connection indicator reads. Keys are the stream's own states. */
@@ -163,6 +167,9 @@
     renderQueue(Boolean(payload.you && payload.you.waiting), payload.queue ? payload.queue.count : 0);
     renderMyGame(payload.you ? payload.you.game : null);
     renderActions(payload.you ? payload.you.game : null);
+    // Every lobby payload says whether this player is in a match, so the decision to be
+    // playing one is made in a single place no matter which of the two sources arrived.
+    syncMatch(payload.you ? payload.you.game : null);
     if (!keepError) showError(state.els['lobby-error'], null);
   }
 
@@ -255,10 +262,11 @@
     if (game.seed) parts.push('seed ' + game.seed);
     setText(state.els['my-game-meta'], parts.join(' \u00b7 '));
 
-    // Only an open game can be cancelled, and only by the player hosting it.
+    // Only an open game can be cancelled, and only by the player hosting it. A playing
+    // game is not a panel with buttons any more — it is a match, and there is nothing to
+    // press here that would not be a way out of a game both players are in.
     var cancellable = game.status === 'open' && game.host.id === (state.me ? state.me.id : null);
     show(state.els['my-game-cancel'], cancellable);
-    show(state.els['my-game-load'], Boolean(game.seed));
   }
 
   // -------------------------------------------------------------------- actions
@@ -325,21 +333,56 @@
   }
 
   /**
-   * Put the server's seed on the local board.
+   * Hand a playing game to the match, or take the board back when there is no longer one.
    *
-   * Phase 2 stops here: a match says which map both players are on, and the board is the
-   * one the client has always had. Playing a networked round is Phase 3.
+   * The lobby payload carries the game but not the shots or the chat — those belong to
+   * the match, and shipping the whole replay log with every lobby broadcast would put the
+   * entire match on the wire each time somebody hosts a game. So a game that is playing
+   * is fetched in full here, once, and match.js is given the result.
+   *
+   * This is also the reconnect path, and the reason it is a fetch rather than a special
+   * case: a tab that reloads mid-match arrives here with `you.game` saying "playing" and
+   * no board at all, and the fetched payload is the seed plus every shot played — which
+   * is everything needed to rebuild the position it left.
    */
-  function loadSeed() {
-    var seed = state.game ? state.game.seed : null;
-    if (!seed || !state.app) return;
-    playLocally();
-    TE.game.reset(state.app.game, seed);
-    TE.render.setSeed(state.app.renderer, seed);
-    if (state.app.controller && state.app.controller.els['seed-input']) {
-      state.app.controller.els['seed-input'].value = seed;
+  function syncMatch(game) {
+    if (!TE.match) return null;
+
+    if (!game || game.status !== 'playing') {
+      if (TE.match.isActive()) TE.match.leave();
+      return null;
     }
-    if (state.app.controller) state.app.controller.refresh(true);
+    // Already playing this one: the stream's own events are keeping it current, and
+    // re-fetching on every lobby broadcast would replay the whole log to no effect.
+    if (TE.match.isActive() && TE.match.state.game.id === game.id) return TE.match.state.game;
+    return fetchMatch(game.id);
+  }
+
+  function fetchMatch(id) {
+    return TE.net.game(id).then(function (result) {
+      if (!result.ok) {
+        if (result.api && result.status === 401) endSession('your session has expired — sign in again');
+        else showError(state.els['lobby-error'], TE.net.errorMessage(result, 'that match could not be loaded'));
+        return null;
+      }
+      return enterMatch(result.json);
+    }, function (err) {
+      onFailure(err, state.els['lobby-error']);
+      return null;
+    });
+  }
+
+  /**
+   * Put the board into the match and take the screens off it.
+   *
+   * The lobby is dismissed rather than left standing: a player whose turn it is has to be
+   * able to see the battlefield, and the net chip is the way back at any time.
+   */
+  function enterMatch(payload) {
+    if (!TE.match || !payload || !payload.game) return null;
+    var game = TE.match.enter(payload);
+    if (game) playLocally();
+    return game;
   }
 
   function submitAuth() {
@@ -387,6 +430,9 @@
         showError(state.els['auth-error'], TE.net.errorMessage(result, 'the lobby did not answer'));
         return;
       }
+      // The lobby payload is where "you are in a match" is read, and renderLobby acts on
+      // it — which is why a reload lands back on the board rather than in a lobby that
+      // happens to mention a game.
       renderLobby(result.json);
       openLobby();
       connectStream();
@@ -396,23 +442,50 @@
   function connectStream() {
     if (state.stream) state.stream.close();
     state.stream = TE.net.openStream({
-      onStatus: setConnection,
+      onStatus: function (status) {
+        var wasLive = state.connection === 'live';
+        setConnection(status);
+        // A stream that has just come back may have missed a shot, and a client that
+        // missed one is behind its opponent with nothing to notice it by. The match is
+        // refetched, which is the one payload that can put it right.
+        if (status === 'live' && !wasLive && TE.match && TE.match.isActive()) TE.match.resync();
+      },
       onEvent: function (name, data) {
         if (name === 'hello' || name === 'lobby') renderLobby(data);
         else if (name === 'queue') renderQueue(Boolean(data.waiting), data.queue ? data.queue.count : 0);
         else if (name === 'match') {
+          // Matched. Nothing is rendered from this directly: the payload is the whole
+          // match, which is match.js's to interpret, and a screen that also read it would
+          // be a second renderer of the same state.
           renderMyGame(data.game);
           showError(state.els['lobby-error'], null);
+          enterMatch(data);
+        } else if (TE.match && EVENTS_OF_A_MATCH[name]) {
+          TE.match.onEvent(name, data);
         }
       }
     });
   }
+
+  /**
+   * The events that belong to a match rather than to the lobby.
+   *
+   * Named here rather than passed straight through, so that a newer server's event — one
+   * this client has never heard of — is ignored instead of being handed to the match as
+   * something it must interpret.
+   */
+  var EVENTS_OF_A_MATCH = {
+    game: true, shot: true, turn: true, chat: true, over: true, desync: true, opponent: true
+  };
 
   function endSession(message) {
     if (state.stream) {
       state.stream.close();
       state.stream = null;
     }
+    // A signed-out tab is not in a match any more, whatever the board is showing: a
+    // networked board whose player has no session is one nobody can act on.
+    if (TE.match && TE.match.isActive()) TE.match.leave();
     state.me = null;
     state.lobby = null;
     setConnection('offline');
@@ -453,7 +526,6 @@
     on(els['queue-btn'], 'click', toggleQueue);
     on(els['lobby-refresh'], 'click', refreshLobby);
     on(els['my-game-cancel'], 'click', cancelGame);
-    on(els['my-game-load'], 'click', loadSeed);
     on(els['logout-btn'], 'click', logout);
 
     // Escape closes whichever screen is open, the same as the win overlay.
@@ -474,6 +546,10 @@
     var opts = options || {};
     state.doc = opts.document || root.document;
     state.app = opts.app || root.TanksEvolved || null;
+
+    // The match panel is wired before anything is asked of a server, so that the first
+    // `match` event has somewhere to land. It is inert until match.enter() is called.
+    if (TE.match) TE.match.init({ app: state.app, document: state.doc, screens: TE.screens });
 
     var missing = [];
     for (var i = 0; i < REQUIRED_IDS.length; i++) {
@@ -524,6 +600,8 @@
     renderLobby: renderLobby,
     setConnection: setConnection,
     playLocally: playLocally,
+    // The way back onto the board from the match, and from the result overlay.
+    openLobby: openLobby,
     // Exposed for the self-test and for a console: the same functions the buttons call.
     refresh: refreshLobby,
     host: hostGame,
@@ -531,7 +609,8 @@
     cancel: cancelGame,
     toggleQueue: toggleQueue,
     logout: logout,
-    loadSeed: loadSeed,
+    syncMatch: syncMatch,
+    enterMatch: enterMatch,
     state: state
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

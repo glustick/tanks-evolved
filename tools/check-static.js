@@ -78,7 +78,8 @@ check('7. index.html loads the js files in a valid dependency order', () => {
   const loaded = scriptSrcs.map((s) => path.basename(s));
   // Every file that exists must be loaded, and must come after its dependencies.
   const order = ['version.js', 'utils.js', 'terrain.js', 'physics.js', 'tanks.js',
-    'render.js', 'audio.js', 'input.js', 'game.js', 'net.js', 'screens.js', 'selftest.js'];
+    'render.js', 'audio.js', 'input.js', 'game.js', 'net.js', 'screens.js', 'match.js',
+    'selftest.js'];
   for (const file of jsFiles) {
     assert(loaded.includes(file), `${file} exists but is not loaded by index.html`);
   }
@@ -212,11 +213,13 @@ check('5. every request the client makes is a relative, same-origin path', () =>
 
 // 6 -------------------------------------------------------------------
 check('6. every element id required by the client exists in index.html', () => {
-  // Two modules own element ids now: input.js the HUD, screens.js the sign-in and lobby
-  // screens. Both export the contract, and both directions are checked for both.
+  // Three modules own element ids now: input.js the HUD, screens.js the sign-in and lobby
+  // screens, match.js the match panel and the chat. Each exports the contract, and both
+  // directions are checked for all three.
   const owners = [
     { file: 'input.js', list: 'REQUIRED_IDS' },
-    { file: 'screens.js', list: 'REQUIRED_IDS' }
+    { file: 'screens.js', list: 'REQUIRED_IDS' },
+    { file: 'match.js', list: 'REQUIRED_IDS' }
   ];
   const ids = [];
   for (const owner of owners) {

@@ -109,6 +109,27 @@
     </p>
   </div>
 
+  <!-- The networked match: who you are playing, whose turn it is, and the chat. It sits
+       beside the board rather than over it — a player whose turn it is has to be able to
+       see the battlefield — and it is only ever shown while a match is on. -->
+  <aside class="match-panel" id="match-panel" hidden>
+    <header class="match-head">
+      <h2 id="match-title">Match</h2>
+      <span class="match-opponent" id="match-opponent"></span>
+      <button id="match-lobby" class="btn tiny ghost" type="button">Lobby</button>
+    </header>
+
+    <p class="match-status" id="match-status" aria-live="polite"></p>
+
+    <ul class="chat-log" id="chat-log" aria-label="Match chat"></ul>
+    <p class="form-error" id="chat-error" role="alert" hidden></p>
+    <form class="chat-form" id="chat-form" novalidate>
+      <input id="chat-input" class="chat-input" type="text" maxlength="500" autocomplete="off"
+             spellcheck="false" placeholder="Say something to your opponent" aria-label="Your message" />
+      <button id="chat-send" class="btn tiny" type="submit">Send</button>
+    </form>
+  </aside>
+
   <div class="modal" id="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <h2 id="modal-title">Player 1 wins</h2>
@@ -117,6 +138,9 @@
         <button id="rematch-btn" class="btn fire" type="button">Rematch</button>
         <button id="modal-new-seed" class="btn" type="button">New map</button>
         <button id="modal-close" class="btn ghost" type="button">View board</button>
+        <!-- Only shown for a networked match, where the other two would rebuild the map
+             underneath an opponent who is still looking at it. -->
+        <button id="modal-lobby-btn" class="btn fire" type="button" hidden>Back to the lobby</button>
       </div>
     </div>
   </div>
@@ -166,7 +190,6 @@
         <h3 id="my-game-title">Your game</h3>
         <p class="lobby-meta" id="my-game-meta"></p>
         <div class="screen-actions">
-          <button id="my-game-load" class="btn tiny" type="button">Load this map locally</button>
           <button id="my-game-cancel" class="btn tiny ghost" type="button">Cancel this game</button>
         </div>
       </section>
@@ -197,6 +220,7 @@
   <script src="js/game.js"></script>
   <script src="js/net.js"></script>
   <script src="js/screens.js"></script>
+  <script src="js/match.js"></script>
   <script src="js/selftest.js"></script>
   <script>
     // Bootstrap. The hash `#selftest` swaps the interactive loop for the
