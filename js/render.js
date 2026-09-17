@@ -1,10 +1,19 @@
 /**
- * render.js — Canvas 2D presentation: studio-lit dark scene, shell-following
- * camera, particle FX and the in-canvas HUD.
+ * render.js — Canvas 2D presentation: ash-and-dust post-apocalyptic scene,
+ * shell-following camera, particle FX and the in-canvas HUD.
  *
  * Everything in this file is cosmetic. Nothing here may feed back into game
  * state, which is what lets the simulation stay deterministic while the eye
  * candy is allowed to depend on frame timing.
+ *
+ * That rule is why the scenery draws from `derive(seed, 'scenery')` and from one
+ * fixed, seed-independent stream, and from nothing else: `terrain`, `spawn`,
+ * `wind` and `ridge` feed the simulation, and drawing a *new* number of values
+ * out of any of them would shift what that stream produces for every existing
+ * seed — a different battlefield, an invalidated tuning table and every stored
+ * replay broken, for a change that is meant to be invisible to the physics.
+ * A new stream cannot do that, and neither can a stream the simulation never
+ * reads (the old `ridge` silhouettes were only ever scenery).
  */
 (function (root) {
   'use strict';
@@ -13,26 +22,41 @@
   var C = TE.CONST;
   var U = TE.utils;
 
+  // Ash, dust and a low burnt-orange horizon. The two player accents are left
+  // alone: they are identity colours the stylesheet shares, and a teal/amber
+  // pair is the one thing in this palette that must not drift.
   var COLORS = {
-    skyTop: '#05070d',
-    skyMid: '#0d1524',
-    skyLow: '#1d2b45',
-    ridgeFar: '#131d31',
-    ridgeNear: '#0c1424',
-    haze: 'rgba(120,170,255,0.06)',
-    groundTop: '#22304a',
-    groundDeep: '#080c13',
-    crust: '#4d6b93',
-    crustGlow: 'rgba(126,196,255,0.5)',
+    skyTop: '#0a0908',       // ash-black overhead
+    skyMid: '#241a14',       // dust brown, most of the sky
+    skyLow: '#63351a',       // burnt orange, low on the horizon
+    horizon: 'rgba(255,138,52,0.30)', // glow band sitting on the horizon
+    sun: 'rgba(255,170,92,0.5)',      // the dust-dimmed sun behind the ruins
+    ruinFar: '#2c2521',      // distant skyline, washed out by dust
+    ruinNear: '#1b1614',     // the nearer one, nearly black
+    ruinEdge: 'rgba(255,150,80,0.18)', // rim light along a broken roofline
+    haze: 'rgba(214,160,110,0.10)',    // dust veil between the two layers
+    groundTop: '#342a20',    // scorched earth under a layer of ash
+    groundDeep: '#0b0908',
+    crust: '#8a6f4e',        // dry lit surface
+    crustGlow: 'rgba(255,164,88,0.40)',
     p1: '#3fe0c4',
     p1Dark: '#0d5148',
     p2: '#ffb057',
     p2Dark: '#5c370f',
     shell: '#fff8e7',
-    wreck: '#2a3140'
+    trailOld: '#8a6f52',
+    trailLive: '#ffd9a0',
+    wreck: '#2a251f',
+    deadWood: '#1c1613',     // dead trees, poles and hulls on the ground line
+    ash: '#cdad86'           // airborne ash
   };
 
   var MAX_PARTICLES = 900;
+
+  // How far below the ground line a backdrop shape is drawn. The terrain is
+  // opaque from its surface down, so anything under this is hidden and the exact
+  // value does not matter — it only has to be more than the deepest valley.
+  var SKYLINE_FOOT = 900;
 
   // --------------------------------------------------------------- lifecycle
   function create(canvas) {
@@ -44,8 +68,11 @@
       particles: [],
       floaters: [],
       scorch: [],
-      stars: [],
-      ridges: [],
+      embers: [],
+      skyline: [],
+      rubble: [],
+      motes: [],
+      sun: { t: 0.5, y: 168 },
       streaks: [],
       sprites: {},
       // Visual-only RNG. Deliberately separate from the match seed: FX may be
@@ -55,9 +82,10 @@
       shake: 0,
       wreckSmokeT: 0,
       skyGrad: null,
-      terrainGrad: null
+      terrainGrad: null,
+      groundRef: null
     };
-    buildStars(r);
+    buildEmbers(r);
     resize(r);
     return r;
   }
@@ -80,43 +108,46 @@
     return r;
   }
 
-  function buildStars(r) {
-    var rng = TE.rng.fromSeed('tanks-evolved-stars');
-    r.stars = [];
-    for (var i = 0; i < 140; i++) {
-      r.stars.push({
+  /**
+   * Ash hanging in the upper air. Fixed stream, like the star field it replaces:
+   * one shape of sky for every seed, and nothing here depends on the match.
+   */
+  function buildEmbers(r) {
+    var rng = TE.rng.fromSeed('tanks-evolved-ash');
+    r.embers = [];
+    for (var i = 0; i < 120; i++) {
+      r.embers.push({
         x: rng.next(),
-        y: rng.next() * 0.55,
-        size: rng.range(0.6, 1.7),
-        alpha: rng.range(0.18, 0.85),
+        y: rng.next() * 0.6,
+        size: rng.range(0.7, 1.9),
+        alpha: rng.range(0.10, 0.42),
         phase: rng.range(0, Math.PI * 2)
       });
     }
   }
 
-  /** Regenerate the seed-dependent parallax silhouettes for a new match. */
+  /**
+   * Regenerate every seed-dependent piece of scenery for a new match: the ruined
+   * skyline where the ridges were, the dead trees and wreckage along the ground
+   * line, the drifting ash, and the sun.
+   *
+   * Heights are stored *relative to the ground line* (see groundLineOf) rather
+   * than as world elevations. A fixed world elevation does not work here: the
+   * ground is drawn as an opaque mass from its surface down, and the surface
+   * moves between 120 and 440, so a backdrop pinned to an elevation is either
+   * buried behind a hill or left floating in the sky over a valley. Anchoring it
+   * to the highest ground in view is what keeps the ruins standing behind the
+   * ridge instead of inside it.
+   *
+   * One stream for all of it — nothing here is read by the simulation, so a new
+   * number of draws from it cannot move a tank or a shell for any seed.
+   */
   function setSeed(r, seed) {
-    var rng = TE.rng.derive(seed, 'ridge');
-    r.ridges = [];
-    var layers = [
-      { samples: 33, base: 150, amplitude: 95, parallax: 0.30, color: COLORS.ridgeFar, alpha: 0.9 },
-      { samples: 25, base: 95, amplitude: 70, parallax: 0.52, color: COLORS.ridgeNear, alpha: 1 }
-    ];
-    for (var l = 0; l < layers.length; l++) {
-      var cfg = layers[l];
-      var points = [];
-      var phase = rng.range(0, Math.PI * 2);
-      var freq = rng.range(1.1, 2.6);
-      var wobble = rng.range(0.5, 1.4);
-      for (var i = 0; i <= cfg.samples; i++) {
-        var t = i / cfg.samples;
-        var y = cfg.base +
-          Math.sin(phase + t * Math.PI * freq) * cfg.amplitude +
-          Math.sin(phase * 2.3 + t * Math.PI * freq * 3.1) * cfg.amplitude * 0.22 * wobble;
-        points.push({ t: t, y: U.clamp(y, 20, 340) });
-      }
-      r.ridges.push({ points: points, parallax: cfg.parallax, color: cfg.color, alpha: cfg.alpha });
-    }
+    var rng = TE.rng.derive(seed, 'scenery');
+    r.sun = { t: rng.range(0.10, 0.45), rise: rng.range(120, 210) };
+    buildSkyline(r, rng);
+    buildRubble(r, rng);
+    buildMotes(r, rng);
     // Wind streaks: thin horizontal dust lines that drift with the wind.
     r.streaks = [];
     for (var s = 0; s < 26; s++) {
@@ -125,10 +156,88 @@
         y: rng.range(30, 420),
         len: rng.range(10, 34),
         speed: rng.range(0.4, 1.1),
-        alpha: rng.range(0.05, 0.16)
+        alpha: rng.range(0.05, 0.18)
       });
     }
     return r;
+  }
+
+  /**
+   * Two parallax layers of ruined skyline: distant towers behind, broken low
+   * blocks in front, which is the usual deep-to-near taper of a skyline seen
+   * across a valley.
+   *
+   * Each layer is a walk across the world width laying down broken blocks: a gap,
+   * then a structure of seeded width and height with one ragged notch in the roof
+   * when the stream says so. Points are emitted in strictly increasing t — a
+   * silhouette that doubles back would fill as a bow tie — and each block
+   * contributes two vertical walls down to well below the ground line, so a
+   * block is a rectangle standing behind the terrain and only its top shows.
+   */
+  function buildSkyline(r, rng) {
+    var layers = [
+      { roofLo: 44, roofHi: 150, parallax: 0.30, color: COLORS.ruinFar, alpha: 0.82 },
+      { roofLo: 12, roofHi: 96, parallax: 0.52, color: COLORS.ruinNear, alpha: 1 }
+    ];
+    var foot = -SKYLINE_FOOT;
+    r.skyline = [];
+    for (var l = 0; l < layers.length; l++) {
+      var cfg = layers[l];
+      var points = [];
+      var t = rng.range(0, 0.03);
+      while (t < 1) {
+        t += rng.range(0.012, 0.07);              // gap between structures
+        if (t >= 1) break;
+        var width = rng.range(0.014, 0.048);
+        // Squared draw: most roofs sit low, a few towers still stand.
+        var top = cfg.roofLo + Math.pow(rng.next(), 1.7) * (cfg.roofHi - cfg.roofLo);
+        points.push({ t: t, y: foot });
+        points.push({ t: t, y: top });
+        if (rng.next() < 0.6) {
+          points.push({ t: t + width * rng.range(0.30, 0.55), y: top - rng.range(6, 24) });
+        }
+        points.push({ t: t + width, y: top - rng.range(0, 9) });
+        points.push({ t: t + width, y: foot });
+        t += width;
+      }
+      if (points.length < 4) points.push({ t: 1, y: foot });
+      r.skyline.push({ points: points, parallax: cfg.parallax, color: cfg.color, alpha: cfg.alpha });
+    }
+  }
+
+  /**
+   * Dead trees, leaning poles and burnt-out hulls standing in front of the
+   * rubble line. Their trunks run far below it so the terrain covers the excess
+   * wherever the local ground is lower than the highest ground in view.
+   */
+  function buildRubble(r, rng) {
+    r.rubble = [];
+    var kinds = ['tree', 'tree', 'tree', 'pole', 'wreck', 'wreck'];
+    for (var i = 0; i < 26; i++) {
+      r.rubble.push({
+        t: rng.next(),
+        kind: rng.pick(kinds),
+        h: rng.range(18, 74),
+        w: rng.range(9, 24),
+        lean: rng.range(-0.22, 0.22),
+        drop: rng.range(0, 40)
+      });
+    }
+  }
+
+  /** Airborne ash: specks that drift with the wind and settle slowly. */
+  function buildMotes(r, rng) {
+    r.motes = [];
+    for (var i = 0; i < 70; i++) {
+      r.motes.push({
+        x: rng.range(0, C.WORLD_W),
+        y: rng.range(30, 470),
+        size: rng.range(0.8, 2.2),
+        alpha: rng.range(0.05, 0.18),
+        fall: rng.range(3, 11),
+        bob: rng.range(0, Math.PI * 2)
+      });
+    }
   }
 
   // ------------------------------------------------------------ coordinates
@@ -187,7 +296,35 @@
     var loY = halfH - 40;
     var hiY = C.WORLD_H + 120 - halfH;
     cam.y = loY >= hiY ? C.WORLD_H / 2 : U.clamp(cam.y, loY, hiY);
+
+    // The backdrop stands behind the highest ground in view, so follow that with
+    // the camera rather than jumping to it — a hill sliding into frame would
+    // otherwise make the whole skyline hop.
+    var ground = groundLineOf(r, world);
+    r.groundRef = U.damp(r.groundRef == null ? ground : r.groundRef, ground, 4, dt);
     return cam;
+  }
+
+  /**
+   * Highest ground in view, in world units — the line the scenery stands behind.
+   *
+   * The ground is drawn as an opaque mass, so a backdrop element is visible
+   * exactly where it rises above the local surface. Anchoring the scenery to the
+   * highest surface on screen means the ruined skyline always has something to
+   * stand behind and never floats over a valley.
+   */
+  function groundLineOf(r, world) {
+    if (!world || !world.terrain) return C.GROUND_MAX;
+    var halfW = (r.w * 0.5) / r.cam.zoom;
+    var lo = Math.max(0, r.cam.x - halfW);
+    var hi = Math.min(C.WORLD_W, r.cam.x + halfW);
+    var step = Math.max(6, (hi - lo) / 24);
+    var peak = C.GROUND_MIN;
+    for (var x = lo; x <= hi; x += step) {
+      var h = TE.terrain.heightAt(world.terrain, x);
+      if (h > peak) peak = h;
+    }
+    return peak;
   }
 
   // ---------------------------------------------------------------- FX input
@@ -233,7 +370,7 @@
         x: x + rng.range(-4, 4), y: y + rng.range(-4, 4),
         vx: Math.cos(base) * rng.range(30, 70) * facing, vy: rng.range(8, 30),
         life: 0, maxLife: rng.range(0.5, 1.1),
-        size: rng.range(4, 9), color: 'rgba(190,205,225,0.5)'
+        size: rng.range(4, 9), color: 'rgba(206,186,160,0.5)'
       });
     }
   }
@@ -259,7 +396,7 @@
         x: x, y: y,
         vx: Math.cos(a) * sp, vy: Math.abs(Math.sin(a)) * sp * 1.15,
         life: 0, maxLife: rng.range(0.7, 1.6),
-        size: rng.range(1.5, 4.2), color: rng.next() < 0.4 ? '#3b4a63' : '#26313f'
+        size: rng.range(1.5, 4.2), color: rng.next() < 0.4 ? '#4a3d2d' : '#2a231b'
       });
     }
     for (i = 0; i < 14; i++) {
@@ -268,7 +405,7 @@
         x: x + rng.range(-10, 10), y: y + rng.range(-6, 10),
         vx: rng.range(-40, 40), vy: rng.range(20, 90),
         life: 0, maxLife: rng.range(0.9, 2.2),
-        size: rng.range(8, 20), color: 'rgba(150,165,185,0.42)'
+        size: rng.range(8, 20), color: 'rgba(178,160,140,0.42)'
       });
     }
     for (i = 0; i < 26; i++) {
@@ -341,7 +478,7 @@
           x: c.x + r.fxRng.range(-4, 4), y: c.y + 6,
           vx: r.fxRng.range(-12, 12), vy: r.fxRng.range(18, 40),
           life: 0, maxLife: r.fxRng.range(1.2, 2.4),
-          size: r.fxRng.range(5, 11), color: 'rgba(120,130,148,0.4)'
+          size: r.fxRng.range(5, 11), color: 'rgba(140,132,122,0.4)'
         });
       }
     }
@@ -355,6 +492,18 @@
         if (sk.x < -60) sk.x += C.WORLD_W + 120;
       }
     }
+
+    // Airborne ash: carried sideways by the wind, settling the whole time.
+    // Position is world-space, so the specks belong to the battlefield rather
+    // than to the viewport — they are the one part of the backdrop a camera pan
+    // moves at the same rate as the ground.
+    for (i = 0; i < r.motes.length; i++) {
+      var m = r.motes[i];
+      m.x += (14 + (world ? world.wind * 34 : 0)) * dt;
+      m.y -= m.fall * dt;
+      if (m.y < 20) { m.y = 470; m.x = (m.x + 640) % C.WORLD_W; }
+      if (m.x > C.WORLD_W) m.x -= C.WORLD_W;
+    }
   }
 
   // ----------------------------------------------------------------- drawing
@@ -366,9 +515,15 @@
     ctx.save();
     ctx.clearRect(0, 0, r.w, r.h);
     ctx.translate(shakeX, shakeY);
-    drawSky(r, world);
-    drawRidges(r);
+    // The scenery is positioned against the ground line, so it is resolved once
+    // for the whole frame: whichever part is drawn, it stands behind the same
+    // ridge. updateCamera damps it; a direct draw() call still gets a value.
+    var ground = r.groundRef == null ? groundLineOf(r, world) : r.groundRef;
+    drawSky(r, world, ground);
+    drawSkyline(r, ground);
+    drawRubble(r, ground);
     drawWindStreaks(r, world);
+    drawMotes(r);
     drawTerrain(r, world);
     drawTrails(r, world);
     drawTanks(r, world);
@@ -379,7 +534,12 @@
     ctx.restore();
   }
 
-  function drawSky(r, world) {
+  /** Screen y of a world elevation. */
+  function screenYOf(r, worldY) {
+    return (r.cam.y - worldY) * r.cam.zoom + r.h * 0.5;
+  }
+
+  function drawSky(r, world, ground) {
     var ctx = r.ctx;
     if (!r.skyGrad) {
       var g = ctx.createLinearGradient(0, 0, 0, r.h);
@@ -391,30 +551,64 @@
     ctx.fillStyle = r.skyGrad;
     ctx.fillRect(0, 0, r.w, r.h);
 
-    // Stars with a slow parallax drift and a gentle twinkle.
-    for (var i = 0; i < r.stars.length; i++) {
-      var s = r.stars[i];
-      var sx = (s.x * C.WORLD_W - r.cam.x * 0.08) * r.cam.zoom + r.w * 0.5;
+    var horizon = screenYOf(r, ground);
+
+    // The burnt-orange band sitting on the horizon. Rebuilt every frame because
+    // it tracks the camera; one gradient is nothing next to the particle count.
+    var band = ctx.createLinearGradient(0, horizon - r.h * 0.55, 0, horizon + 40);
+    band.addColorStop(0, 'rgba(255,138,52,0)');
+    band.addColorStop(0.75, COLORS.horizon);
+    band.addColorStop(1, 'rgba(255,170,90,0.06)');
+    ctx.fillStyle = band;
+    ctx.fillRect(0, horizon - r.h * 0.55, r.w, r.h * 0.55 + 40);
+
+    drawSun(r, ground);
+
+    // Ash in the upper air, drifting slowly sideways with the camera.
+    for (var i = 0; i < r.embers.length; i++) {
+      var e = r.embers[i];
+      var sx = (e.x * C.WORLD_W - r.cam.x * 0.08 + r.time * 4) * r.cam.zoom + r.w * 0.5;
       sx = ((sx % r.w) + r.w) % r.w;
-      var sy = s.y * r.h * 0.6 - (r.cam.y - C.WORLD_H / 2) * 0.05;
-      var twinkle = 0.75 + 0.25 * Math.sin(r.time * 1.4 + s.phase);
-      ctx.globalAlpha = s.alpha * twinkle;
-      ctx.fillStyle = '#cfe3ff';
-      ctx.fillRect(sx, sy, s.size, s.size);
+      var sy = e.y * r.h * 0.6 - (r.cam.y - C.WORLD_H / 2) * 0.05;
+      if (sy > horizon) continue; // below the ground line is the ground's business
+      ctx.globalAlpha = e.alpha * (0.7 + 0.3 * Math.sin(r.time * 0.9 + e.phase));
+      ctx.fillStyle = COLORS.ash;
+      ctx.fillRect(sx, sy, e.size, e.size);
     }
     ctx.globalAlpha = 1;
   }
 
-  function drawRidges(r) {
+  /** A dust-dimmed sun, low and behind the ruins. */
+  function drawSun(r, ground) {
+    var ctx = r.ctx;
+    var sun = r.sun;
+    var cx = ((sun.t * C.WORLD_W) - r.cam.x * 0.15) * r.cam.zoom + r.w * 0.5;
+    var cy = screenYOf(r, ground + sun.rise);
+    var radius = Math.max(28, 96 * r.cam.zoom);
+    if (cx < -radius || cx > r.w + radius) return;
+    var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+    grad.addColorStop(0, COLORS.sun);
+    grad.addColorStop(0.42, 'rgba(255,150,70,0.16)');
+    grad.addColorStop(1, 'rgba(255,140,60,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /**
+   * Ruined skyline, tiled in camera space so the range keeps covering the
+   * viewport however far the camera pans. A dust veil goes over the far layer
+   * before the near one is drawn, which is what separates them.
+   */
+  function drawSkyline(r, ground) {
     var ctx = r.ctx;
     var bottom = r.h + 40;
-    for (var l = 0; l < r.ridges.length; l++) {
-      var layer = r.ridges[l];
+    for (var l = 0; l < r.skyline.length; l++) {
+      var layer = r.skyline[l];
       var n = layer.points.length;
       var zoom = r.cam.zoom;
       var spanPx = C.WORLD_W * zoom;
-      // Tiles of the silhouette, laid out in camera space, so the range keeps
-      // covering the viewport however far the camera pans.
       var anchor = r.cam.x * layer.parallax;
       var firstTile = Math.floor((anchor - (r.w * 0.5 + 120) / zoom) / C.WORLD_W) - 1;
       var lastTile = Math.ceil((anchor + (r.w * 0.5 + 120) / zoom) / C.WORLD_W) + 1;
@@ -425,7 +619,7 @@
         for (var i = 0; i < n; i++) {
           var pt = layer.points[i];
           var sx = ((t + pt.t) * C.WORLD_W - anchor) * zoom + r.w * 0.5;
-          var sy = (r.cam.y - pt.y) * zoom + r.h * 0.5;
+          var sy = screenYOf(r, ground + pt.y);
           ctx.lineTo(sx, sy);
         }
       }
@@ -435,11 +629,129 @@
       ctx.fillStyle = layer.color;
       ctx.fill();
       ctx.globalAlpha = 1;
-      // A thin lit edge along the top of each ridge.
-      ctx.strokeStyle = l === 0 ? 'rgba(90,130,200,0.13)' : 'rgba(120,180,255,0.16)';
+      // A thin lit edge along the broken roofline.
+      ctx.strokeStyle = l === 0 ? 'rgba(255,150,80,0.10)' : COLORS.ruinEdge;
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      // Dust between the layers, so the far skyline sits behind something. It
+      // fades out above the rooflines instead of washing the sky flat.
+      if (l === 0) {
+        var top = screenYOf(r, ground + 190);
+        var veil = ctx.createLinearGradient(0, top - r.h * 0.18, 0, top + r.h * 0.5);
+        veil.addColorStop(0, 'rgba(214,160,110,0)');
+        veil.addColorStop(0.5, COLORS.haze);
+        veil.addColorStop(1, 'rgba(214,160,110,0)');
+        ctx.fillStyle = veil;
+        ctx.fillRect(0, top - r.h * 0.18, r.w, r.h * 0.68);
+      }
     }
+  }
+
+  /**
+   * Dead trees, poles and burnt-out hulls standing in front of the near skyline
+   * and still behind the heightfield, so the ground covers their feet wherever
+   * the terrain is high. Their trunks run on down past the ground line for the
+   * same reason: what is under the surface is never seen.
+   */
+  function drawRubble(r, ground) {
+    var ctx = r.ctx;
+    var zoom = r.cam.zoom;
+    var anchor = r.cam.x * 0.78;
+    var firstTile = Math.floor((anchor - (r.w * 0.5 + 120) / zoom) / C.WORLD_W) - 1;
+    var lastTile = Math.ceil((anchor + (r.w * 0.5 + 120) / zoom) / C.WORLD_W) + 1;
+
+    ctx.save();
+    ctx.globalAlpha = 0.94;
+    ctx.strokeStyle = COLORS.deadWood;
+    ctx.fillStyle = COLORS.deadWood;
+    ctx.lineCap = 'round';
+
+    for (var t = firstTile; t <= lastTile; t++) {
+      for (var i = 0; i < r.rubble.length; i++) {
+        var p = r.rubble[i];
+        var sx = ((t + p.t) * C.WORLD_W - anchor) * zoom + r.w * 0.5;
+        if (sx < -60 || sx > r.w + 60) continue;
+        var foot = screenYOf(r, ground - p.drop);
+        var len = (p.h + p.drop) * zoom;
+        ctx.save();
+        ctx.translate(sx, foot);
+        if (p.kind === 'tree') drawDeadTree(ctx, p, len, zoom);
+        else if (p.kind === 'pole') drawDeadPole(ctx, p, len, zoom);
+        else drawHull(ctx, p, len, zoom);
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+
+  /**
+   * A trunk with bare branches: no leaves, and never quite upright. Drawn
+   * downward past the ground line as well, so where the surrounding ground sits
+   * lower than the line the tree still reaches into it rather than floating.
+   */
+  function drawDeadTree(ctx, p, len, zoom) {
+    var lean = p.lean;
+    ctx.lineWidth = Math.max(1, 2.2 * zoom);
+    ctx.beginPath();
+    ctx.moveTo(0, SKYLINE_FOOT * zoom);
+    ctx.lineTo(lean * len, -len);
+    ctx.stroke();
+    ctx.lineWidth = Math.max(0.8, 1.3 * zoom);
+    for (var b = 0; b < 4; b++) {
+      var at = 0.45 + b * 0.14;
+      var bx = lean * len * at;
+      var by = -len * at;
+      var side = b % 2 === 0 ? 1 : -1;
+      var arm = Math.max(5, len * (0.34 - b * 0.04));
+      ctx.beginPath();
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx + side * arm, by - arm * 0.9);
+      ctx.stroke();
+    }
+  }
+
+  /** A leaning post with one crossbar left on it. */
+  function drawDeadPole(ctx, p, len, zoom) {
+    var lean = p.lean;
+    ctx.lineWidth = Math.max(1, 2 * zoom);
+    ctx.beginPath();
+    ctx.moveTo(0, SKYLINE_FOOT * zoom);
+    ctx.lineTo(lean * len * 0.7, -len * 0.7);
+    ctx.stroke();
+    ctx.lineWidth = Math.max(1, 1.6 * zoom);
+    ctx.beginPath();
+    ctx.moveTo(lean * len * 0.5 - p.w * 0.3 * zoom, -len * 0.55);
+    ctx.lineTo(lean * len * 0.5 + p.w * 0.3 * zoom, -len * 0.62);
+    ctx.stroke();
+  }
+
+  /** A burnt-out hull, canted over and missing its turret. */
+  function drawHull(ctx, p, len, zoom) {
+    ctx.save();
+    ctx.rotate(p.lean);
+    var w = Math.max(6, p.w * zoom);
+    var bh = Math.max(5, len * 0.5);
+    roundRect(ctx, -w / 2, -bh, w, bh, Math.min(3, bh / 2));
+    ctx.fill();
+    // The stump of a mounting, which is what makes it read as a wreck.
+    roundRect(ctx, -w * 0.18, -bh - bh * 0.28, w * 0.36, bh * 0.3, Math.min(2, bh * 0.12));
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /** Ash specks in the play space, drawn behind the ground. */
+  function drawMotes(r) {
+    var ctx = r.ctx;
+    ctx.fillStyle = COLORS.ash;
+    for (var i = 0; i < r.motes.length; i++) {
+      var m = r.motes[i];
+      var p = worldToScreen(r, m.x, m.y);
+      if (p.x < -10 || p.x > r.w + 10) continue;
+      ctx.globalAlpha = m.alpha * (0.75 + 0.25 * Math.sin(r.time * 1.3 + m.bob));
+      ctx.fillRect(p.x, p.y, m.size, m.size);
+    }
+    ctx.globalAlpha = 1;
   }
 
   function drawWindStreaks(r, world) {
@@ -448,7 +760,7 @@
     if (mag < 0.05) return;
     var ctx = r.ctx;
     var dir = world.wind > 0 ? 1 : -1;
-    ctx.strokeStyle = 'rgb(190,215,255)';
+    ctx.strokeStyle = 'rgb(226,186,146)';
     ctx.lineWidth = 1;
     for (var i = 0; i < r.streaks.length; i++) {
       var s = r.streaks[i];
@@ -515,7 +827,7 @@
     if (!r.terrainGrad) {
       var g = ctx.createLinearGradient(0, 0, 0, r.h);
       g.addColorStop(0, COLORS.groundTop);
-      g.addColorStop(0.45, '#17202f');
+      g.addColorStop(0.45, '#1e1712');
       g.addColorStop(1, COLORS.groundDeep);
       r.terrainGrad = g;
     }
@@ -548,7 +860,7 @@
     ];
     for (s = 0; s < strata.length; s++) {
       surfacePath(strata[s].offset);
-      ctx.strokeStyle = 'rgba(150,190,240,' + strata[s].alpha + ')';
+      ctx.strokeStyle = 'rgba(226,178,120,' + strata[s].alpha + ')';
       ctx.stroke();
     }
     ctx.restore();
@@ -629,10 +941,10 @@
     }
 
     // Tracks.
-    ctx.fillStyle = tank.alive ? '#111823' : '#0b0f16';
+    ctx.fillStyle = tank.alive ? '#141210' : '#0d0b0a';
     roundRect(ctx, -hullW * 0.56, -trackH, hullW * 1.12, trackH, 2.4 * z);
     ctx.fill();
-    ctx.strokeStyle = tank.alive ? bodyDark : '#242a35';
+    ctx.strokeStyle = tank.alive ? bodyDark : '#2b2620';
     ctx.lineWidth = 1;
     // Road wheels.
     for (var w = -2; w <= 2; w++) {
@@ -646,7 +958,7 @@
     ctx.fillStyle = tank.alive ? bodyDark : COLORS.wreck;
     roundRect(ctx, -hullW * 0.5, hullTop, hullW, hullH, 3 * z);
     ctx.fill();
-    ctx.fillStyle = tank.alive ? body : '#3a4150';
+    ctx.fillStyle = tank.alive ? body : '#3d3730';
     roundRect(ctx, -hullW * 0.42, hullTop + 1.6 * z, hullW * 0.84, hullH * 0.42, 2 * z);
     ctx.fill();
 
@@ -672,7 +984,7 @@
     } else {
       // Wreck: canted hull, no barrel.
       ctx.rotate(0.16);
-      ctx.fillStyle = '#1a1f29';
+      ctx.fillStyle = '#181410';
       roundRect(ctx, -hullW * 0.4, hullTop - 3 * z, hullW * 0.8, hullH * 0.8, 2 * z);
       ctx.fill();
     }

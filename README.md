@@ -263,9 +263,13 @@ node server/test/match.test.js    # 16 checks: the relay, chat, results, presenc
 ## Determinism
 
 Every random value comes from a mulberry32 stream derived from the seed
-(`version`, `terrain`, `spawn`, `wind`, `ridge`), so subsystems cannot
+(`version`, `terrain`, `spawn`, `wind`, `scenery`), so subsystems cannot
 accidentally share a sequence. `Math.random()` is never called — `tools/check-static.js`
-and `tools/check-determinism.js` both fail if it appears.
+and `tools/check-determinism.js` both fail if it appears. Drawing a *new* number of values
+out of an existing stream is what the rule protects: it would shift that stream's output
+for every seed, and with it the battlefield, the tuning table and every stored replay. So
+a new subsystem gets a new name — the post-apocalyptic scenery, which replaced the old
+`ridge` parallax layers, draws from `scenery` and is read by nothing else.
 
 The match advances on a fixed timestep (`1/120 s`, `4` collision substeps) with an
 accumulator, so the outcome does not depend on frame rate or on how long a tab was

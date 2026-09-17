@@ -3,18 +3,22 @@
    A clean, dark, "modern ops console" look: hairline borders, soft glows,
    monospaced numbers. The 8-bit heritage lives in the game feel, not here.
    No frameworks, no web fonts, no external assets (works from file://).
+
+   The palette is warm and dust-dimmed to match the battlefield drawn in
+   js/render.js — ash, embers and a low sun — but the structure is untouched:
+   this is still the same console, lit by a different fire.
 --------------------------------------------------------------------------- */
 
 :root {
-  --bg: #05070c;
-  --bg-2: #0a0f18;
+  --bg: #080706;
+  --bg-2: #100d0a;
   --panel: rgba(255, 255, 255, 0.028);
   --panel-2: rgba(255, 255, 255, 0.05);
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.16);
-  --text: #e8eefb;
-  --muted: #8c9ab2;
-  --muted-2: #5f6b80;
+  --text: #f2e9dd;
+  --muted: #a3968a;
+  --muted-2: #6d6157;
   --p1: #3fe0c4;
   --p1-dim: rgba(63, 224, 196, 0.15);
   --p2: #ffb057;
@@ -42,10 +46,11 @@ html, body {
 }
 
 body {
-  /* A faint radial wash so the page does not read as flat black. */
+  /* A faint radial wash so the page does not read as flat black: a hot ember
+     above, cold ash below. */
   background-image:
-    radial-gradient(1200px 600px at 50% -10%, rgba(70, 130, 220, 0.14), transparent 70%),
-    radial-gradient(900px 500px at 100% 110%, rgba(255, 140, 60, 0.06), transparent 70%);
+    radial-gradient(1200px 600px at 50% -10%, rgba(255, 138, 52, 0.10), transparent 70%),
+    radial-gradient(900px 500px at 100% 110%, rgba(120, 96, 72, 0.10), transparent 70%);
 }
 
 h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
@@ -140,7 +145,7 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
   border-radius: 6px;
   outline: none;
 }
-.seed-input:focus { border-color: rgba(120, 180, 255, 0.5); box-shadow: 0 0 0 3px rgba(120, 180, 255, 0.12); }
+.seed-input:focus { border-color: rgba(255, 176, 87, 0.5); box-shadow: 0 0 0 3px rgba(255, 176, 87, 0.12); }
 
 /* ----------------------------------------------------------------- buttons */
 .btn {
@@ -158,7 +163,7 @@ h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 }
 .btn:hover { background: rgba(255, 255, 255, 0.09); }
 .btn:active { transform: translateY(1px); }
-.btn:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.6); outline-offset: 2px; }
+.btn:focus-visible { outline: 2px solid rgba(255, 176, 87, 0.6); outline-offset: 2px; }
 .btn.tiny { padding: 4px 8px; font-size: 11px; }
 .btn.ghost { background: transparent; color: var(--muted); }
 .btn.ghost:hover { color: var(--text); }
@@ -206,7 +211,7 @@ kbd {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
-  background: #04060a;
+  background: #060504;
   box-shadow: inset 0 0 60px rgba(0, 0, 0, 0.7), 0 20px 50px rgba(0, 0, 0, 0.45);
 }
 
@@ -340,7 +345,7 @@ input[type="range"] {
 input[type="range"]::-webkit-slider-runnable-track {
   height: 6px;
   border-radius: 999px;
-  background: linear-gradient(90deg, rgba(120, 180, 255, 0.35), rgba(255, 255, 255, 0.12));
+  background: linear-gradient(90deg, rgba(255, 176, 87, 0.35), rgba(255, 255, 255, 0.12));
   border: 1px solid var(--line);
 }
 input[type="range"]::-webkit-slider-thumb {
@@ -349,20 +354,20 @@ input[type="range"]::-webkit-slider-thumb {
   height: 18px;
   margin-top: -7px;
   border-radius: 50%;
-  background: linear-gradient(180deg, #ffffff, #b9c8de);
+  background: linear-gradient(180deg, #fff6e9, #d8c3a6);
   border: 1px solid rgba(0, 0, 0, 0.4);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
 }
 input[type="range"]::-moz-range-track {
   height: 6px;
   border-radius: 999px;
-  background: linear-gradient(90deg, rgba(120, 180, 255, 0.35), rgba(255, 255, 255, 0.12));
+  background: linear-gradient(90deg, rgba(255, 176, 87, 0.35), rgba(255, 255, 255, 0.12));
 }
 input[type="range"]::-moz-range-thumb {
   width: 16px; height: 16px; border-radius: 50%;
   background: #fff; border: 1px solid rgba(0, 0, 0, 0.4);
 }
-input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55); outline-offset: 4px; border-radius: 6px; }
+input[type="range"]:focus-visible { outline: 2px solid rgba(255, 176, 87, 0.55); outline-offset: 4px; border-radius: 6px; }
 
 .shortcuts {
   margin: 0;
@@ -412,7 +417,7 @@ input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55)
   width: min(430px, 100%);
   border: 1px solid var(--line-strong);
   border-radius: 18px;
-  background: linear-gradient(180deg, #0d1420, #080c14);
+  background: linear-gradient(180deg, #16120e, #0c0a08);
   padding: 24px 22px 20px;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
@@ -447,8 +452,8 @@ input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55)
   outline: none;
 }
 .field input:focus {
-  border-color: rgba(120, 180, 255, 0.5);
-  box-shadow: 0 0 0 3px rgba(120, 180, 255, 0.12);
+  border-color: rgba(255, 176, 87, 0.5);
+  box-shadow: 0 0 0 3px rgba(255, 176, 87, 0.12);
 }
 
 .screen-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -562,7 +567,7 @@ input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55)
   width: min(420px, 100%);
   border: 1px solid var(--line-strong);
   border-radius: 18px;
-  background: linear-gradient(180deg, #0d1420, #080c14);
+  background: linear-gradient(180deg, #16120e, #0c0a08);
   padding: 26px 24px 20px;
   text-align: center;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.06);
@@ -672,7 +677,7 @@ input[type="range"]:focus-visible { outline: 2px solid rgba(120, 180, 255, 0.55)
   border-radius: var(--radius-sm);
   outline: none;
 }
-.chat-input:focus { border-color: rgba(120, 180, 255, 0.5); }
+.chat-input:focus { border-color: rgba(255, 176, 87, 0.5); }
 
 /* ------------------------------------------------------------- responsive */
 @media (max-width: 900px) {
