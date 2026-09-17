@@ -83,48 +83,33 @@ phase cheap, and it is the shape everything below has.
   profiles against a running server) for a whole match, a mid-match reload, and a board
   deliberately knocked out of step; that harness was temporary and is not in the repository.
 
+### The battlefield after the fire, and solid cover
+
+- **The look.** The night sky is gone: an ash-and-dust palette with a low burnt-orange
+  horizon, the star field replaced by drifting ash, the parallax ridges replaced by a
+  ruined skyline in two depth layers, wreckage along the ground line (dead trees, poles,
+  burnt hulls), airborne motes and a dust-dimmed sun. Renderer only — all of it is drawn
+  from a new `scenery` stream, never from `terrain`, `spawn`, `wind` or `ridge`, so no
+  existing seed's battle changed. Proved rather than asserted: the determinism suite
+  produces byte-identical output before and after that commit.
+- **The cover.** Six mirrored barriers between x=480 and x=1120, three per half, from a
+  new `cover` stream and placed in the band x∈[30%,70%] so they never stand in a spawn
+  band. They are **static**: a hit carves a crater at the foot, but the block keeps its
+  top, so a wall cannot be sunk by shelling it — the top is part of the map, the base
+  follows the terrain beneath it.
+- **Fairness is a height cap, not a gap in the band.** A shell passes over a wall at that
+  wall's own x, so open ground between two walls is a corridor nothing flies through. The
+  45°/full-power arc clears the highest barrier by at least 72 units across 54 seeds, and
+  the worst clean shot still lands 41 units from the enemy against a 66-unit blast radius.
+- `stateHash` folds in a cover checksum beside the terrain's, so two clients cannot
+  disagree about the walls while the hash reports agreement.
+- `detectImpact` resolves cover after tanks and before terrain — a barrier stands *on* the
+  ground, so terrain first would swallow every wall hit.
+- Covered by checks 10–17 of `tools/check-determinism.js`: layout determinism, mirroring,
+  no spawn inside a wall, a firing line across 50 seeds, a wall hit against a shot over
+  the top, and hash sensitivity.
+
 ## Next
-
-### A post-apocalyptic pass, and real cover between the tanks
-
-Requested for the next session. Two halves that look similar and are not: how the
-battlefield reads, and what a shell can actually hit. They carry very different risk, and
-the first is the safe one.
-
-**The look is renderer-only and must stay outside the simulation.** Today the backdrop is
-a night sky — a three-stop blue gradient, a fixed star field, and two parallax ridge
-layers from `derive(seed, 'ridge')` in `js/render.js`. A post-apocalyptic pass means a
-different palette (ash, dust, a low burnt-orange horizon), a ruined skyline where the
-ridges are, wreckage and dead trees on the ground, debris and haze in the air. All of that
-is scenery, and it has to be drawn from a **new named stream** — never from `terrain`,
-`spawn`, `wind` or `ridge`, because those four feed the simulation. Changing what an
-existing stream produces would alter the battle for every existing seed, and invalidate
-the tuning table and every stored replay with it; a new stream cannot. The renderer
-already sets the precedent: the star field uses its own fixed
-`fromSeed('tanks-evolved-stars')` and the effects layer uses `'fx-visual'`.
-
-**The cover is gameplay, and it changes the hash.** `detectImpact` in `js/physics.js`
-resolves a shell against tanks, then terrain, then "lost". Solid cover is a fourth case,
-and that means three things follow from it:
-
-- placement from a **new named stream**, mirrored, so neither player gets the better
-  position — the same fairness rule the weapon pickups need;
-- a checksum over the layout in `TE.game.stateHash()`, following the pattern
-  `TE.terrain.checksum()` already sets. Without it two clients can disagree about the
-  cover and the hash will report agreement;
-- a decision on destructibility. Static cover is simpler and makes the geometry part of
-  the map; destructible cover behaves like terrain and has to enter the replay log the way
-  craters already do, which is the more interesting of the two and the more expensive.
-
-**Two constraints to settle before building it.** A shell must have a way through: the
-measured range table gives 45° at full power about 1557 units and the tanks spawn 900 to
-1400 apart, so cover placed carelessly between them makes a match unwinnable rather than
-interesting — the placement rule needs a guaranteed firing line, or a height below the
-apex of a full-power arc. And `pickSpawnX` currently takes the flattest of twelve seeded
-candidates, which will need to avoid dropping a tank inside a wall as well.
-
-Both halves land together, because cover is what makes the terrain read as a place rather
-than a curve — but they are separate commits, and the barrier one carries the risk.
 
 ### Hardening before this faces the internet
 
@@ -218,6 +203,9 @@ drop layout wants a checksum there for the same reason the terrain has one.
 ground out from under one should drop it and settle it again. That is the falling and
 settling path the tanks already use, and this would be the third feature to want it.
 
+- Destructible cover. The walls are static for now, which is what makes them cheap and
+  keeps the geometry part of the map; a wall that loses height with each hit would behave
+  like terrain and have to enter the replay log the way craters already do.
 - Server-side simulation in a worker thread, so the state hash is authoritative
   rather than merely cross-checked — and so a desync can be resolved rather than only
   detected. The simulation core already loads headlessly in Node, so this is wiring
