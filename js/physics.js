@@ -52,8 +52,16 @@
 
   /**
    * Detect what the shell hit between its previous and current position.
+   *
+   * Resolution order is tank, then cover, then terrain, then off-map — and the
+   * order is deliberate at each step. A tank first, because a direct hit has to
+   * stay a direct hit whatever it was standing behind. Cover before terrain,
+   * because a barrier *stands on* the ground: its base is embedded in the
+   * heightfield, so testing the ground first would resolve every shot at a
+   * barrier's foot as a terrain hit and the barrier could never be struck at all.
+   *
    * @returns {null|{type:string, x:number, y:number, speed:number, tank?:object}}
-   *          type is 'tank' | 'terrain' | 'lost'
+   *          type is 'tank' | 'cover' | 'terrain' | 'lost'
    */
   function detectImpact(world, p) {
     // 1. Tanks (swept circle test so a fast shell cannot tunnel through).
@@ -66,14 +74,26 @@
       }
     }
 
-    // 2. Terrain.
+    // 2. Solid cover. A swept rectangle test, so the shell stops on the face it
+    //    met and the impact point is on that face rather than inside the block.
+    if (world.cover && world.cover.length) {
+      var block = TE.terrain.coverHit(world.terrain, world.cover, p.px, p.py, p.x, p.y);
+      if (block) {
+        return {
+          type: 'cover', x: block.x, y: block.y,
+          speed: Math.hypot(p.vx, p.vy)
+        };
+      }
+    }
+
+    // 3. Terrain.
     var surface = TE.terrain.heightAt(world.terrain, p.x);
     if (p.y <= surface) {
       var hit = refineSurfaceCrossing(world.terrain, p.px, p.py, p.x, p.y);
       return { type: 'terrain', x: hit.x, y: hit.y, speed: Math.hypot(p.vx, p.vy) };
     }
 
-    // 3. Off the map: a miss, no explosion.
+    // 4. Off the map: a miss, no explosion.
     if (p.x < -80 || p.x > C.WORLD_W + 80 || p.y > C.WORLD_H + 420 || p.y < -1400) {
       return { type: 'lost', x: p.x, y: p.y, speed: Math.hypot(p.vx, p.vy) };
     }
@@ -109,7 +129,7 @@
    * Run a shell to its conclusion without touching world state.
    * Used by tools/check-determinism.js for tuning reports and by the self-test.
    *
-   * @param {object} world    a world with `terrain`, `tanks` (only read) and `wind`
+   * @param {object} world    a world with `terrain`, `tanks`, `cover` (only read) and `wind`
    * @param {object} shot     { x, y, angle, power, facing, ownerId, wind }
    * @param {object} [opts]   { maxTime, dt }
    * @returns {object} impact event plus `{ time, samples }`

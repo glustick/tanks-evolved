@@ -48,7 +48,18 @@
     trailLive: '#ffd9a0',
     wreck: '#2a251f',
     deadWood: '#1c1613',     // dead trees, poles and hulls on the ground line
-    ash: '#cdad86'           // airborne ash
+    ash: '#cdad86',          // airborne ash
+    // Solid cover: lit from the low sun, so it reads as an object standing in the
+    // battlefield rather than as more silhouette. Nothing else on the field is
+    // drawn this way, which is what keeps a barrier distinguishable from scenery.
+    blockTop: '#77664f',
+    blockMid: '#4a3d31',
+    blockDeep: '#221b16',
+    blockEdge: 'rgba(255,206,148,0.8)',
+    blockSeam: 'rgba(0,0,0,0.45)',
+    blockOutline: 'rgba(8,6,5,0.85)',
+    blockGrit: 'rgba(255,214,166,0.35)',
+    blockFoot: 'rgba(48,40,32,0.7)'
   };
 
   var MAX_PARTICLES = 900;
@@ -375,6 +386,36 @@
     }
   }
 
+  /**
+   * A shell breaking on a barrier: sparks off the face and a little dust, but no
+   * crater and no scorch — nothing here was destroyed, and a wall that left a mark
+   * in the ground would be read as damage the simulation is not applying.
+   */
+  function addSparks(r, x, y, speed) {
+    var rng = r.fxRng;
+    var s = U.clamp((speed || 400) / 900, 0.4, 1.2);
+    for (var i = 0; i < 14; i++) {
+      var a = rng.range(-Math.PI, 0); // sparks come off upward: the shell hit a wall
+      var sp = rng.range(70, 300) * s;
+      spawnParticle(r, {
+        type: 'spark',
+        x: x, y: y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: 0, maxLife: rng.range(0.18, 0.5),
+        size: rng.range(1, 2.2), color: rng.next() < 0.5 ? '#ffd9a0' : '#fff6e0'
+      });
+    }
+    for (i = 0; i < 6; i++) {
+      spawnParticle(r, {
+        type: 'smoke',
+        x: x + rng.range(-6, 6), y: y + rng.range(-4, 6),
+        vx: rng.range(-26, 26), vy: rng.range(10, 40),
+        life: 0, maxLife: rng.range(0.6, 1.4),
+        size: rng.range(5, 11), color: 'rgba(186,168,148,0.4)'
+      });
+    }
+  }
+
   /** Explosion at an impact point: shock ring, dirt, smoke and sparks. */
   function addExplosion(r, x, y, radius, strength) {
     var rng = r.fxRng;
@@ -525,6 +566,7 @@
     drawWindStreaks(r, world);
     drawMotes(r);
     drawTerrain(r, world);
+    drawCover(r, world);
     drawTrails(r, world);
     drawTanks(r, world);
     drawShell(r, world);
@@ -773,6 +815,102 @@
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
+  }
+
+  /**
+   * Solid cover, drawn exactly where the simulation tests it — the same rect, the
+   * same footing read off the heightfield. A wall drawn a pixel away from the wall
+   * a shell stops against is a bug the player sees before anybody else does, so
+   * there is no separate idea of what a barrier looks like.
+   *
+   * It has to read as a *thing* rather than as more skyline: the ruin silhouettes
+   * behind it are pillars of much the same proportions, and the difference has to
+   * be unmistakable or the player cannot tell what stops a shell and what does not.
+   * So unlike the scenery this is lit — concrete pale enough to separate from the
+   * dark backdrop, a hard outline, a bright rim on top, and panel seams and rivets
+   * that belong to no other object on the field.
+   */
+  function drawCover(r, world) {
+    var blocks = world.cover;
+    if (!blocks || !blocks.length) return;
+    var ctx = r.ctx;
+    var zoom = r.cam.zoom;
+    var halfW = (r.w * 0.5) / zoom;
+
+    for (var i = 0; i < blocks.length; i++) {
+      var block = blocks[i];
+      if (block.x + block.w < r.cam.x - halfW - 40 || block.x - block.w > r.cam.x + halfW + 40) continue;
+
+      var rect = TE.terrain.coverRect(world.terrain, block);
+      var x0 = worldToScreen(r, rect.x0, rect.y1).x;
+      var y0 = worldToScreen(r, 0, rect.y1).y;
+      var x1 = worldToScreen(r, rect.x1, 0).x;
+      var y1 = worldToScreen(r, 0, rect.y0).y;
+      var w = x1 - x0;
+      var h = y1 - y0;
+
+      ctx.save();
+      var grad = ctx.createLinearGradient(0, y0, 0, y1);
+      grad.addColorStop(0, COLORS.blockTop);
+      grad.addColorStop(0.4, COLORS.blockMid);
+      grad.addColorStop(1, COLORS.blockDeep);
+      ctx.fillStyle = grad;
+      ctx.fillRect(x0, y0, w, h);
+
+      // Horizontal panel seams with a rivet at each end: a poured slab, not a
+      // boulder, and the one shape on the field nothing else has.
+      var seams = Math.max(1, Math.min(4, Math.round(h / (26 * zoom))));
+      ctx.lineWidth = 1;
+      for (var s = 1; s <= seams; s++) {
+        var sy = Math.round(y0 + (h * s) / (seams + 1)) + 0.5;
+        ctx.strokeStyle = COLORS.blockSeam;
+        ctx.beginPath();
+        ctx.moveTo(x0, sy);
+        ctx.lineTo(x1, sy);
+        ctx.stroke();
+        if (w > 16) {
+          ctx.fillStyle = COLORS.blockGrit;
+          ctx.fillRect(x0 + w * 0.16, sy + 1, 1.4, 1.4);
+          ctx.fillRect(x1 - w * 0.16 - 1.4, sy + 1, 1.4, 1.4);
+        }
+      }
+
+      // A hard outline, so a wall in front of a dark ruin still has an edge.
+      ctx.strokeStyle = COLORS.blockOutline;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0 + 0.5, y0 + 0.5, w - 1, h - 1);
+
+      // Lit rim along the top and the upper part of the sunward edge; a low sun
+      // is the only light there is.
+      ctx.strokeStyle = COLORS.blockEdge;
+      ctx.lineWidth = Math.max(1, 1.6 * zoom);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y0);
+      ctx.stroke();
+      if (w > 8) {
+        ctx.strokeStyle = COLORS.blockGrit;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x1 - 0.5, y0);
+        ctx.lineTo(x1 - 0.5, y0 + h * 0.55);
+        ctx.moveTo(x0 + 0.5, y0);
+        ctx.lineTo(x0 + 0.5, y0 + h * 0.3);
+        ctx.stroke();
+      }
+
+      // Ash banked against the foot, so the wall sits in the ground rather than
+      // on top of it. Clipped to the block's own column, so it never spills.
+      ctx.beginPath();
+      ctx.rect(x0 - 1, y0, w + 2, h + 1);
+      ctx.clip();
+      ctx.fillStyle = COLORS.blockFoot;
+      ctx.beginPath();
+      ctx.ellipse((x0 + x1) * 0.5, y1 - 1, w * 0.85, Math.max(2, 7 * zoom), 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
   }
 
   function drawTerrain(r, world) {
@@ -1217,6 +1355,7 @@
     addScorch: addScorch,
     addMuzzleFlash: addMuzzleFlash,
     addExplosion: addExplosion,
+    addSparks: addSparks,
     pushFloater: pushFloater,
     draw: draw
   };

@@ -25,20 +25,55 @@
   var DEFAULT_SEED = 'EAGLE-4821';
 
   // ------------------------------------------------------------- match setup
+  /** How uneven the ground is under x — smaller is flatter. */
+  function spawnFlatness(terrain, x) {
+    var flat = Math.abs(TE.terrain.heightAt(terrain, x + 14) - TE.terrain.heightAt(terrain, x - 14));
+    flat += Math.abs(TE.terrain.heightAt(terrain, x + 30) - TE.terrain.heightAt(terrain, x - 30)) * 0.5;
+    return flat;
+  }
+
   /**
    * Choose a spawn x inside [minFrac, maxFrac] of the map, preferring flat
    * ground so tanks do not start on a cliff edge. Uses the seeded stream, so
    * the same seed always places the tanks identically.
+   *
+   * A candidate that overlaps a barrier is rejected: a tank inside a wall is
+   * unshootable, unburiable and unable to hit anything, so it is the one place on
+   * the map a spawn must never land. The cover layout keeps out of both spawn
+   * bands by construction, so in practice this guard never fires and every
+   * existing seed spawns exactly where it used to — it is here for the day the
+   * layout moves, and because a spawn inside a wall is not a failure anybody
+   * would recognise by looking at it.
+   *
+   * All twelve candidates are drawn either way, so the spawn stream is read the
+   * same number of times whether or not anything is blocked.
    */
-  function pickSpawnX(terrain, rng, minFrac, maxFrac) {
+  function pickSpawnX(terrain, cover, rng, minFrac, maxFrac) {
     var best = null;
-    for (var i = 0; i < 12; i++) {
+    var bestFree = null;
+    var i;
+    for (i = 0; i < 12; i++) {
       var x = U.lerp(minFrac, maxFrac, rng.next()) * C.WORLD_W;
-      var flat = Math.abs(TE.terrain.heightAt(terrain, x + 14) - TE.terrain.heightAt(terrain, x - 14));
-      flat += Math.abs(TE.terrain.heightAt(terrain, x + 30) - TE.terrain.heightAt(terrain, x - 30)) * 0.5;
+      var flat = spawnFlatness(terrain, x);
       if (!best || flat < best.flat) best = { x: x, flat: flat };
+      if (!TE.terrain.coverBlocksX(cover, x) && (!bestFree || flat < bestFree.flat)) {
+        bestFree = { x: x, flat: flat };
+      }
     }
-    return best.x;
+    if (bestFree) return bestFree.x;
+
+    // Every seeded candidate landed in a wall. Sweep the band for the flattest
+    // clear spot instead of settling for a spot that happens to be flat: a tank
+    // standing inside a barrier is worse than a tank on a slope.
+    var lo = minFrac * C.WORLD_W;
+    var hi = maxFrac * C.WORLD_W;
+    var sweep = null;
+    for (var sx = lo; sx <= hi; sx += 4) {
+      if (TE.terrain.coverBlocksX(cover, sx)) continue;
+      var f = spawnFlatness(terrain, sx);
+      if (!sweep || f < sweep.flat) sweep = { x: sx, flat: f };
+    }
+    return sweep ? sweep.x : best.x;
   }
 
   /** Create a match object. Hooks are attached later by boot(). */
@@ -51,11 +86,12 @@
   /** Start a fresh match on the given seed (used by "Rematch" / "New map"). */
   function reset(game, seed) {
     var terrain = TE.terrain.create(seed);
+    var cover = TE.terrain.createCover(seed, terrain);
     var spawnRng = TE.rng.derive(seed, 'spawn');
 
     var tanks = [
-      TE.tank.create(1, pickSpawnX(terrain, spawnRng, 0.05, 0.22), terrain),
-      TE.tank.create(2, pickSpawnX(terrain, spawnRng, 0.78, 0.95), terrain)
+      TE.tank.create(1, pickSpawnX(terrain, cover, spawnRng, 0.05, 0.22), terrain),
+      TE.tank.create(2, pickSpawnX(terrain, cover, spawnRng, 0.78, 0.95), terrain)
     ];
 
     game.seed = seed;
@@ -64,6 +100,7 @@
     game.world = {
       seed: seed,
       terrain: terrain,
+      cover: cover,
       tanks: tanks,
       wind: 0,
       windRng: TE.rng.derive(seed, 'wind'),
@@ -123,6 +160,21 @@
   /**
    * Apply an impact: carve the crater, damage tanks by distance falloff,
    * notify the presentation layer, then hand over to the settling phase.
+   *
+   * A shell that breaks on a wall is resolved like any other impact — it blows a
+   * hole in the ground where it went off, which at a wall is its foot — and the
+   * wall is what does not change. That is the split that makes cover static: the
+   * terrain is destructible and always was, the block's height never is. Nothing
+   * here needs to know which kind of impact it is.
+   *
+   * The blast is resolved for a wall hit too, so a tank sheltering behind one
+   * still takes the falloff damage of the shell that broke on it. That is the
+   * whole value of cover: it costs the attacker damage rather than cancelling the
+   * shot.
+   *
+   * Destructible cover — a wall that loses height, and therefore has to enter the
+   * replay log the way craters do — is the follow-up this pass deliberately left
+   * out.
    */
   function resolveImpact(game, event) {
     var w = game.world;
@@ -265,13 +317,20 @@
   /**
    * Stable fingerprint of everything that affects the outcome. The self-test
    * compares two runs of the same seed and expects identical hashes.
+   *
+   * The cover layout is in here next to the terrain, and for the same reason the
+   * terrain is: it is map geometry both clients simulate against. Leaving it out
+   * would let two clients agree on a hash while disagreeing about where the walls
+   * are — shells would break on one machine and land on the other, and the check
+   * that exists to catch exactly that would report agreement.
    */
   function stateHash(game) {
     var w = game.world;
     var parts = [
       String(w.seed), w.state, 'turn' + game.turn, 'active' + w.activeIndex,
       'wind' + w.wind.toFixed(6), 'shots' + w.shotCount,
-      'terrain' + TE.terrain.checksum(w.terrain)
+      'terrain' + TE.terrain.checksum(w.terrain),
+      'cover' + TE.terrain.coverChecksum(w.cover)
     ];
     for (var i = 0; i < w.tanks.length; i++) {
       var t = w.tanks[i];
@@ -391,8 +450,16 @@
 
       R.addExplosion(renderer, event.x, event.y, C.BLAST_RADIUS, strength);
       R.addScorch(renderer, event.x, event.y, C.CRATER_RADIUS * 0.9);
+      if (event.type === 'cover') {
+        // A wall hit throws sparks off a solid face and rings like armour rather
+        // than sounding like earth. The crater it leaves at the foot is the same
+        // crater as anywhere else, so the scorch is drawn as usual.
+        R.addSparks(renderer, event.x, event.y, event.speed);
+        A.armorHit();
+      } else {
+        A.explosion(strength, cameraDistance);
+      }
       R.addShake(renderer, 10 * strength);
-      A.explosion(strength, cameraDistance);
 
       for (var i = 0; i < info.results.length; i++) {
         var r = info.results[i];
@@ -431,6 +498,7 @@
     stateHash: stateHash,
     resolveImpact: resolveImpact,
     finishTurn: finishTurn,
+    pickSpawnX: pickSpawnX,
     boot: boot,
     DEFAULT_SEED: DEFAULT_SEED
   };

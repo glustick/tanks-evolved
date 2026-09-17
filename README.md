@@ -263,33 +263,44 @@ node server/test/match.test.js    # 16 checks: the relay, chat, results, presenc
 ## Determinism
 
 Every random value comes from a mulberry32 stream derived from the seed
-(`version`, `terrain`, `spawn`, `wind`, `scenery`), so subsystems cannot
+(`version`, `terrain`, `spawn`, `wind`, `scenery`, `cover`), so subsystems cannot
 accidentally share a sequence. `Math.random()` is never called — `tools/check-static.js`
 and `tools/check-determinism.js` both fail if it appears. Drawing a *new* number of values
 out of an existing stream is what the rule protects: it would shift that stream's output
 for every seed, and with it the battlefield, the tuning table and every stored replay. So
 a new subsystem gets a new name — the post-apocalyptic scenery, which replaced the old
-`ridge` parallax layers, draws from `scenery` and is read by nothing else.
+`ridge` parallax layers, draws from `scenery`, the cover layout draws from `cover`, and
+neither is read by anything else.
 
 The match advances on a fixed timestep (`1/120 s`, `4` collision substeps) with an
 accumulator, so the outcome does not depend on frame rate or on how long a tab was
 hidden. Visual effects use their own seeded stream and frame time; they never feed
 back into game state.
 
-`TE.game.stateHash(game)` fingerprints terrain, wind, turn, both tanks and the
-shell, and is what the browser self-test compares across two runs — and what the two
-clients in a networked match compare after every turn, with the server storing each turn's
-value in the replay log so a replay can check itself rather than only agreeing at the end.
+`TE.game.stateHash(game)` fingerprints the terrain, the cover layout, wind, turn, both
+tanks and the shell, and is what the browser self-test compares across two runs — and what
+the two clients in a networked match compare after every turn, with the server storing each
+turn's value in the replay log so a replay can check itself rather than only agreeing at the
+end. Cover is in there for the same reason the terrain is: two clients that built different
+walls would otherwise agree on the hash while disagreeing about what a shell can hit, which
+is exactly the failure the hash exists to catch.
 
 ## Verification
 
 All three commands are self-contained (no install step, no dependencies).
 
-**1. Simulation core, in Node (9 checks + a range report)**
+**1. Simulation core, in Node (17 checks + a range report)**
 
 ```bash
 node tools/check-determinism.js
 ```
+
+Checks 1–9 are the simulation the match rests on: terrain, spawns, wind, an identical
+shot landing identically, craters, and no `Math.random()` anywhere. Checks 10–17 cover the
+barriers: the layout is seed-derived and mirrored, no tank spawns inside one, a firing line
+exists between the spawns across 50 seeds, a shell aimed into one breaks on it and stops on
+the face, a shell aimed over one still lands, the layout is in `stateHash`, and the tuning
+numbers below are still the numbers they were before cover existed.
 
 Expected tail:
 
@@ -297,9 +308,13 @@ Expected tail:
 PASS  8. craters are deterministic, dig-only, bounded and slope-limited
       dug 1245.3 units, max depth 34.1 (cap 34.1), steepest column step 2.650 (limit 2.90), second hit dug 1245.3
 PASS  9. no Math.random() in js/
-      5 files scanned, 0 occurrences
+      13 files scanned, 0 occurrences
+PASS 13. a firing line exists between the two spawns (50 seeds)
+      reference 45°/100 arc clears every barrier between the spawns by ≥72.1 units (seed-49 P2 over x=1098); all 108 spawn pairs land a clean shot, the worst 40.7 units from the tank (seed-41 P1); every pair also has aims that break on a barrier
 ...
-9/9 checks passed
+design: 6 mirrored barriers between x=480 and x=1120, heights 27/42/44 (cap 52)
+design: the 45°/100 arc clears the highest barrier between the spawns by ≥72 units over 54 seeds, and the worst clean shot still lands 41 units from the enemy (blast radius 66)
+17/17 checks passed
 ```
 
 **2. Static constraints (7 checks)**
@@ -443,17 +458,41 @@ Tanks usually spawn 900–1400 units apart, so a cross-map shot needs 80–100% 
 A shell removes a crater up to 34 units deep and 62 units wide; a direct hit costs
 52.5 integrity, a point-blank splash 42, and damage falls to zero at 66 units.
 
+Cover sits in the band between the two spawn groups (`x` from 30% to 70% of the map),
+three barriers per side, each mirrored in the centre so neither player has the better
+position. They are 24–44 units wide and 26–52 units tall above the ground they were built
+on. The height cap is the firing line: full power at 45° has to be able to clear any of
+them, and over 50 seeds the tightest clearance the reference arc has is 72 units, with a
+shot that reaches the enemy always available from both spawns (the worst of them lands 41
+units from the tank). A barrier's top never moves once the match starts; its footing
+follows the ground, so shelling the base of one exposes its foundation rather than
+destroying it.
+
 ## Notes and known limits
 
 - Rendering is verified by headless screenshots (aiming, mid-flight, explosion,
   win screen) plus the self-test driving 240 frames and the UI test's drag/click
-  session. Explosion particles were inspected at 0 and +30 frames.
+  session. Explosion particles were inspected at 0 and +30 frames. The post-apocalyptic
+  pass and the cover were inspected the same way: aiming, a shell in flight toward a
+  barrier, and the frame it breaks on one — plus the crater at the wall's foot a few
+  frames later, with the wall still standing where it was.
 - Audio is only started from a real click or keypress (browser autoplay policy), so
   the page is silent until the first interaction; a headless run is silent by design.
 - The camera frames both tanks while aiming and follows the shell while it flies.
   Below `0.45x` the view is clamped, and the ground is drawn continuing past both
   map ends so a zoomed-out view never shows a void.
-- One shell type, no tank movement, no AI — by design for Phase 0.
+- One shell type, no tank movement, no AI — by design for Phase 0. Cover is
+  **static**: a barrier's height is part of the map and never changes, a shell that breaks
+  on one leaves a crater at its foot rather than damaging it. Destructible cover would have
+  to enter the replay log the way craters do, and is the deliberate follow-up.
+- **A replay stored before the cover landed will not check out.** `stateHash` now folds in
+  the cover layout, so every hash an older build recorded is a different string from the one
+  the same board produces now. A finished match in the database is history and unaffected in
+  practice; a match *in progress* across the deploy is the case to watch — a client that
+  reloads into one replays the log, disagrees with the stored hashes and reports a desync,
+  because the server cannot tell a changed build from two boards that genuinely diverged.
+  Both players run the same build, so a match started after the deploy is unaffected, and
+  the local `file://` game stores no hashes at all.
 - **Running the client without the server is supported, and looks like it always did.**
   From `file://` nothing is requested at all; on a static host the API answers HTML (or
   404) and the client treats that as "no lobby here" rather than as a session. In both

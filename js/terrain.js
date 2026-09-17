@@ -1,11 +1,18 @@
 /**
- * terrain.js — seeded heightfield generation and crater destruction.
+ * terrain.js — seeded heightfield generation, crater destruction, and the solid
+ * cover that stands on the heightfield.
  *
  * The battlefield is a 1-D heightfield (one elevation sample every
  * CONST.TERRAIN_STEP world units). A heightfield cannot represent overhangs,
  * which makes it the classic Artillery-Duel shape: shells carve round bites
  * out of the ground, tanks may end up on a pillar or in a hole, and collision
  * tests stay trivial and exactly deterministic.
+ *
+ * Cover is the other half of the same idea and lives here for the same reason:
+ * it is solid map geometry, it is derived from the seed, and it is tested against
+ * a shell with closed-form arithmetic. Its base follows the live heightfield, so a
+ * crater dug at its foot is filled by the block's foundation rather than leaving
+ * it standing on air; its top does not move, which is what "static cover" means.
  *
  * Everything here is a pure function of its arguments — no Math.random,
  * no DOM — so tools/check-determinism.js can run it under Node's `vm`.
@@ -22,6 +29,199 @@
   var SMOOTH_PASSES = 2;      // pre-game smoothing passes over the generated field
   var TALUS_PASSES = 4;       // relaxation passes after each crater
   var CRATER_DEPTH_RATIO = 0.55; // pit depth as a fraction of crater radius
+
+  // ------------------------------------------------------------------ cover
+  // Three blocks are laid out on the left half of the band and each is mirrored
+  // about the world centre, so the two sides are the same wall in the same place
+  // and neither player is handed the better position. Three per half rather than
+  // more: a wall every few dozen units stops reading as an obstacle and starts
+  // reading as a fence.
+  var COVER_HALF_COUNT = 3;
+  var COVER_BAND_LO = 0.30;   // barriers stand between the spawn bands, never in one
+  var COVER_BAND_HI = 0.70;
+  var COVER_WIDTH_MIN = 24;
+  var COVER_WIDTH_MAX = 44;
+  var COVER_HEIGHT_MIN = 26;
+  // The firing line. The roadmap offered two ways to keep a match winnable: leave a
+  // gap in the band, or keep the cover below the arc. This is the second, because a
+  // gap in x does not help a shell — a shell passes over each wall at that wall's own
+  // x, so what it needs from cover is height, not width, and open ground between two
+  // walls is a corridor nothing flies through.
+  //
+  // A full-power 45° shot reaches ~1557 units and the tanks spawn 900-1400 apart, so
+  // this cap is what keeps the cross-map arc above every barrier. Measured against
+  // the real terrain and both spawns over 50 seeds, the 45°/100 arc clears the
+  // highest barrier top by 72 units at its tightest point (check 13 in
+  // tools/check-determinism.js measures it).
+  var COVER_HEIGHT_MAX = 52;
+  var COVER_CENTRE_GAP = 20;  // clear ground either side of the world centre
+  var COVER_CELL_MARGIN = 6;  // minimum open ground at the edge of a placement cell
+  // How far a block runs on below the surface. Buried, so it is never seen — it
+  // is what keeps the footing underground once a shell has blown the ground out
+  // from in front of it, rather than leaving a gap under the near corner.
+  var COVER_EMBED = 30;
+  var COVER_CLEARANCE = 20;   // keep-out radius around a barrier, for a spawn
+
+  /**
+   * Seeded, mirrored cover layout, standing on the terrain it is given.
+   *
+   * A block's top is fixed where the layout puts it: the ground under it at the
+   * start of the match, plus its height. Its *base* follows the live heightfield,
+   * so the block grows downward as the ground is blown away at its foot and never
+   * floats. That asymmetry is the whole of "static cover": digging under a wall
+   * exposes its foundation, it does not sink it, and the wall's protection is the
+   * same on the last turn as on the first. Reading the top off the live surface
+   * instead would make craters a slow-motion way to destroy cover — the
+   * destructible version this pass deliberately left out.
+   *
+   * The top depends on the terrain, so the layout is a function of the seed *and*
+   * the terrain both. Both are derived from the seed and neither is mutated here,
+   * so the layout is still identical wherever and whenever it is rebuilt.
+   *
+   * @param {number|string} seed
+   * @param {object} terrain as returned by create()
+   * @returns {Array<{x:number, w:number, h:number, base:number, mirror:boolean}>}
+   */
+  function createCover(seed, terrain) {
+    if (!terrain) throw new Error('createCover needs the terrain its blocks stand on');
+    var rng = TE.rng.derive(seed, 'cover');
+    var centre = C.WORLD_W * 0.5;
+    var lo = C.WORLD_W * COVER_BAND_LO;
+    // Stop short of the centre so a mirrored pair can never overlap there.
+    var hi = centre - COVER_CENTRE_GAP - COVER_WIDTH_MAX * 0.5;
+    var cell = (hi - lo) / COVER_HALF_COUNT;
+    var blocks = [];
+
+    for (var i = 0; i < COVER_HALF_COUNT; i++) {
+      var w = rng.range(COVER_WIDTH_MIN, COVER_WIDTH_MAX);
+      var h = rng.range(COVER_HEIGHT_MIN, COVER_HEIGHT_MAX);
+      // One block per cell, so two blocks can never be placed on top of each
+      // other however the stream falls — no rejection loop, no unbounded draw.
+      var cellLo = lo + i * cell + w * 0.5 + COVER_CELL_MARGIN;
+      var cellHi = lo + (i + 1) * cell - w * 0.5 - COVER_CELL_MARGIN;
+      var x = rng.range(cellLo, Math.max(cellLo, cellHi));
+      // The footing is read once, here, and travels with the block from then on.
+      blocks.push({ x: x, w: w, h: h, base: heightAt(terrain, x), mirror: false });
+      blocks.push({
+        x: C.WORLD_W - x, w: w, h: h,
+        base: heightAt(terrain, C.WORLD_W - x), mirror: true
+      });
+    }
+    return blocks;
+  }
+
+  /**
+   * Order-sensitive checksum of a cover layout, in the same shape as
+   * `checksum(terrain)` and for the same reason: `TE.game.stateHash()` has to
+   * fold the walls in, or two clients can build different walls, agree about the
+   * battlefield and never notice. Returns a hex string.
+   *
+   * The footing is hashed as well as the shape. It is not derivable any more once
+   * the ground under a wall has been dug away, and two clients that placed the
+   * same wall on different ground would stop shells in different places.
+   */
+  function coverChecksum(cover) {
+    var h = 0x811c9dc5;
+    var list = cover || [];
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
+      var parts = [
+        Math.round(b.x * 100) | 0,
+        Math.round(b.w * 100) | 0,
+        Math.round(b.h * 100) | 0,
+        Math.round(b.base * 100) | 0
+      ];
+      for (var p = 0; p < parts.length; p++) {
+        h ^= parts[p];
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+    }
+    return ('00000000' + h.toString(16)).slice(-8);
+  }
+
+  /**
+   * The rectangle a block occupies right now, in world units: a fixed top, and a
+   * base that drops with the ground under it.
+   */
+  function coverRect(terrain, block) {
+    var ground = heightAt(terrain, block.x);
+    return {
+      x0: block.x - block.w * 0.5,
+      x1: block.x + block.w * 0.5,
+      y0: Math.min(block.base, ground) - COVER_EMBED,
+      y1: block.h + block.base
+    };
+  }
+
+  /** Elevation of the top of a block, in world units. Fixed for the whole match. */
+  function coverTop(block) {
+    return block.base + block.h;
+  }
+
+  /** Does a vertical slab of half-width `clearance` at x overlap any block? */
+  function coverBlocksX(cover, x, clearance) {
+    var pad = clearance == null ? COVER_CLEARANCE : clearance;
+    var list = cover || [];
+    for (var i = 0; i < list.length; i++) {
+      if (x + pad > list[i].x - list[i].w * 0.5 && x - pad < list[i].x + list[i].w * 0.5) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Where the segment (x0, y0) -> (x1, y1) enters a block, or null.
+   *
+   * Slab clipping rather than a point test: a shell travels up to ~2 units per
+   * substep and the substep is not the unit the geometry is expressed in, so the
+   * swept segment is what has to be tested — "a shell cannot pass through" is
+   * then a property of the arithmetic rather than of the timestep being small.
+   *
+   * @returns {null|{x:number, y:number}} entry point
+   */
+  function coverHit(terrain, cover, x0, y0, x1, y1) {
+    var list = cover || [];
+    var dx = x1 - x0;
+    var dy = y1 - y0;
+    // Nearest entry first, so a shell crossing two blocks resolves against the
+    // one it reached first.
+    var best = null;
+    var bestT = Infinity;
+
+    for (var i = 0; i < list.length; i++) {
+      var r = coverRect(terrain, list[i]);
+      var lo = 0;
+      var hi = 1;
+      var t;
+
+      if (dx === 0) {
+        if (x0 < r.x0 || x0 > r.x1) continue;
+      } else {
+        var tx0 = (r.x0 - x0) / dx;
+        var tx1 = (r.x1 - x0) / dx;
+        if (tx0 > tx1) { t = tx0; tx0 = tx1; tx1 = t; }
+        if (tx0 > lo) lo = tx0;
+        if (tx1 < hi) hi = tx1;
+        if (lo > hi) continue;
+      }
+
+      if (dy === 0) {
+        if (y0 < r.y0 || y0 > r.y1) continue;
+      } else {
+        var ty0 = (r.y0 - y0) / dy;
+        var ty1 = (r.y1 - y0) / dy;
+        if (ty0 > ty1) { t = ty0; ty0 = ty1; ty1 = t; }
+        if (ty0 > lo) lo = ty0;
+        if (ty1 < hi) hi = ty1;
+        if (lo > hi) continue;
+      }
+
+      if (lo < bestT) {
+        bestT = lo;
+        best = { x: x0 + dx * lo, y: y0 + dy * lo };
+      }
+    }
+    return best;
+  }
 
   /**
    * Recursive midpoint displacement ("fractal Brownian motion, 1-D").
@@ -192,6 +392,21 @@
     heightAt: heightAt,
     slopeAt: slopeAt,
     carve: carve,
-    checksum: checksum
+    checksum: checksum,
+    createCover: createCover,
+    coverChecksum: coverChecksum,
+    coverRect: coverRect,
+    coverTop: coverTop,
+    coverBlocksX: coverBlocksX,
+    coverHit: coverHit,
+    // Exported so the determinism checks can assert against the shipped limits
+    // instead of restating them, which is how a cap quietly stops being enforced.
+    COVER_LIMITS: {
+      heightMax: COVER_HEIGHT_MAX,
+      clearance: COVER_CLEARANCE,
+      halfCount: COVER_HALF_COUNT,
+      bandLo: COVER_BAND_LO,
+      bandHi: COVER_BAND_HI
+    }
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
