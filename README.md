@@ -127,10 +127,7 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `tools/check-static.js` | Static constraint checks (assets exist, no modules, no external URLs, same-origin requests, DOM id contract, load order). |
 | `tools/headless-check.sh` | Loads the page in headless Chrome twice and fails on console errors. |
 | `tools/check-ui.js` | End-to-end UI test over the DevTools protocol: real clicks, drags, win screen, rematch. |
-| `Dockerfile` | Single-stage `nginx:1.30-alpine` image: these static files, an unprivileged port, no build step. |
-| `nginx.conf` | MIME types, cache headers, gzip and the `try_files` fallback — the whole server config. |
-| `docker-compose.yml` | Local run on `:8080`, with a read-only root filesystem and tmpfs for nginx's writable paths. |
-| `.dockerignore` | Keeps `tools/`, `README.md` and the git history out of the build context and the image. |
+| `.dockerignore` | Keeps `tools/`, `README.md`, the git history and the server's local state out of the build context — both images are built from this directory. |
 | `server/index.js` | Server entry point: env → database → listen, plus signal and crash handling. |
 | `server/lib/` | The service itself: routing, static serving, scrypt passwords, cookie sessions, rate limiting, SQLite storage, and the realtime hub — the lobby, the match relay and presence (`lobby.js`). |
 | `server/test/auth.test.js` | 20-check auth suite over real HTTP against a spawned server, no dependencies. |
@@ -154,6 +151,20 @@ node server/index.js                              # http://127.0.0.1:8081
 PORT=9000 TANKS_DB=/tmp/t.db node server/index.js # or point it somewhere else
 ```
 
+The image is `server/Dockerfile`: `node:24-alpine`, running as the unprivileged `node`
+user, listening on **8081**, with a healthcheck that asks `/api/health`. It is built from
+**the repository root**, because it serves the client that lives above `server/`:
+
+```bash
+docker build -f server/Dockerfile -t tanks-evolved-server .
+TANKS_DATA_DIR=/some/host/dir docker compose -f server/compose.yaml up -d
+```
+
+The database lives in `/data`, which the image declares as a volume so `--read-only` works
+with no extra flags. A bind mount over it **replaces its ownership**, so on a host where
+the directory does not already belong to uid 1000 the server exits at boot — `chown
+1000:1000` it first.
+
 | Endpoint | |
 | --- | --- |
 | `GET /api/health` | `{ ok, version }` — the container healthcheck target, no auth |
@@ -174,7 +185,8 @@ PORT=9000 TANKS_DB=/tmp/t.db node server/index.js # or point it somewhere else
 | `GET /api/stream` | Server-Sent Events: `hello` on connect, then `lobby`, `queue`, `match`, `game`, `shot`, `chat`, `turn`, `over`, `desync`, `opponent` |
 
 Anything else under `/api/` is a JSON 404, or a 405 with `Allow` for a known path with the
-wrong method. Every other path serves the client under the same rules as `nginx.conf`.
+wrong method. Every other path serves the client, with the MIME types, cache headers and
+shell fallback that `server/lib/static.js` implements.
 
 Passwords use scrypt with the cost parameters stored per row, so the work factor can be
 raised later without invalidating existing hashes. Sessions are opaque 32-byte tokens in
@@ -446,38 +458,6 @@ browser that is not the runner's, and the phase's real acceptance evidence is
 `server/test/match.test.js`, which drives the same journey through the API without a
 browser in the way.
 
-## Docker
-
-Two images live here, and only one of them is deployed. **The server image is the
-deployment** — `server/Dockerfile`, published to GHCR, carrying the Node service that
-serves the game and the API from one origin; see [Server](#server). The image described in
-this section is the **self-host** one: `nginx:1.30-alpine` with this directory copied into
-its document root, no Node and no build step, for hosting the game alone with no accounts
-or lobby. It is built from this repo and is no longer published to a registry.
-
-```bash
-docker build -t tanks-evolved .
-docker run --rm -p 8080:8080 tanks-evolved      # → http://localhost:8080
-```
-
-Or with compose, which builds the same image and adds a read-only root filesystem:
-
-```bash
-docker compose up --build                       # → http://localhost:8080
-```
-
-| Detail | Value |
-| --- | --- |
-| Port in the container | `8080`, unprivileged — the image runs as the `nginx` user |
-| Host port | `-p <any>:8080` with `docker run`; compose publishes `8080` |
-| `index.html` | `Cache-Control: no-cache` — revalidated, so a deploy is picked up |
-| `css/`, `js/` | `Cache-Control: public, max-age=3600`, for the reason in `nginx.conf` |
-| Unknown paths | served the game shell via `try_files`, not a bare 404 |
-
-`tools/` and `README.md` are left out of the image deliberately: nothing at runtime
-reads them, and the document root is served over HTTP, so copying `tools/` would publish
-the test harness at the same URLs as the game.
-
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main`, on every pull request, and on
@@ -487,7 +467,7 @@ the test harness at the same URLs as the game.
 | --- | --- | --- |
 | `suite` | `22` and `24` | `node tools/check-determinism.js`, then `node tools/check-static.js` |
 | `browser` | `22` | `tools/headless-check.sh`, then `node tools/check-ui.js`, against the runner's Chrome |
-| `docker` | — | `docker build`, then `curl` the running container for real game markup |
+| `docker` | — | Builds `server/Dockerfile`, runs it under `--read-only`, and asserts `/api/health`, the game markup, the MIME types and the shell fallback |
 | `server` | `24` | `node server/test/auth.test.js`, then `node server/test/lobby.test.js`, then `node server/test/match.test.js` |
 | `publish` | — | Builds and pushes the **server** image — **only** on `main` or a `v*` tag, and only after every check above has passed |
 

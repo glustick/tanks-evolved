@@ -1,12 +1,12 @@
 name: CI
 
-  # The project is a static client plus a zero-dependency server, so CI is five
-  # independent questions: does the simulation still behave (Node), does the page still
-  # boot in a real browser (Chrome), does the artifact we would actually ship serve the
-  # game (Docker), do accounts, sessions, the lobby and a networked match still work (the
-  # server suites), and — only once everything says yes — can the images be published for
-  # the host that runs them (GHCR). Nothing is installed anywhere; every check below runs
-  # as-is, which is the whole point of the repo having no dependencies.
+# The project is a client plus a zero-dependency server, so CI is four independent
+# questions: does the simulation still behave (Node), does the page still boot in a real
+# browser (Chrome), does the image we would actually ship serve the game when it is run
+# (Docker), do accounts, the session, the lobby and a networked match still work (the
+# server suites), and — only once everything says yes — can it be published for the host
+# that runs it (GHCR). Nothing is installed anywhere; every check runs as-is, which is
+# the whole point of the repo having no dependencies.
 
 on:
   push:
@@ -90,43 +90,59 @@ jobs:
           run_check headless-check.sh ./tools/headless-check.sh
           run_check check-ui.js node tools/check-ui.js
 
+  # The server image is the one that ships, so this is a container-level test of the
+  # artifact that actually gets deployed. Nothing else in this workflow starts the image:
+  # the server suites exercise the process directly, and publish only builds and pushes.
+  # Without this, a broken COPY would be published and not discovered until a host pulled it.
   docker:
-    name: docker image + smoke test
+    name: server image + smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Build the image
-        run: docker build -t tanks-evolved:ci .
+        run: docker build -t tanks-evolved-server:ci -f server/Dockerfile .
 
-      - name: Serve it and check what comes back
+      - name: Run it and check what comes back
         run: |
           set -euo pipefail
 
-          # 8099 on the host bound to loopback: a port nothing else on the runner is
-          # using, and one that cannot be answered by anything but this container.
-          docker run -d --name tanks-evolved-ci -p 127.0.0.1:8099:8080 tanks-evolved:ci
+          # --read-only with only a tmpfs for /tmp is the shape the host runs, and the
+          # image declares /data as a volume so the database has somewhere to go without
+          # a mount. 8099 on loopback is a port nothing else on the runner answers.
+          docker run -d --name tanks-evolved-ci --read-only --tmpfs /tmp \
+            -p 127.0.0.1:8099:8081 tanks-evolved-server:ci
 
-          # nginx is listening a moment after the container starts, so poll for the
-          # first response instead of sleeping a fixed amount and hoping.
+          # The process is listening a moment after the container starts, so poll rather
+          # than sleeping a fixed amount and hoping.
           ready=0
           for _ in $(seq 1 30); do
-            if curl -fsS -o /dev/null http://127.0.0.1:8099/; then ready=1; break; fi
+            if curl -fsS -o /dev/null http://127.0.0.1:8099/api/health; then ready=1; break; fi
             sleep 1
           done
           if [ "$ready" -ne 1 ]; then
             echo "::error::the container never answered on :8099"
+            docker logs tanks-evolved-ci || true
+            exit 1
+          fi
+
+          # The health endpoint is what a host's stack status is built from, and it reports
+          # the version the process read from js/version.js — which is the difference
+          # between "something is listening" and "this build is serving".
+          health="$(curl -sS http://127.0.0.1:8099/api/health)"
+          echo "GET /api/health      -> $health"
+          if ! printf '%s' "$health" | grep -q '"ok":true'; then
+            echo "::error::/api/health did not report ok"
             exit 1
           fi
 
           body="$(mktemp)"
 
-          # A 200 alone proves nothing — a static host will happily return 200 for the
-          # wrong page, or for a directory listing. Assert the markup the game boots
-          # from, which is the difference between "the container is up" and "the
-          # container is serving this game".
+          # A 200 alone proves nothing: the server falls back to the shell for unknown
+          # paths, so it will answer 200 with the wrong thing quite happily. Assert the
+          # markup the game boots from.
           status="$(curl -sS -o "$body" -w '%{http_code}' http://127.0.0.1:8099/)"
-          echo "GET /               -> $status"
+          echo "GET /                -> $status"
           if [ "$status" != "200" ]; then
             echo "::error::GET / returned $status, expected 200"
             exit 1
@@ -154,13 +170,22 @@ jobs:
             *) echo "::error::script served as $js_type"; exit 1 ;;
           esac
 
-          # Unknown paths are sent to the shell on purpose (see nginx.conf): that is the
-          # difference between a mistyped URL landing on the game and landing on a bare
-          # 404 page with nothing on it.
+          # An unknown path is served the game shell on purpose, which is the difference
+          # between a mistyped URL landing on the game and landing on a bare 404.
           miss_status="$(curl -sS -o "$body" -w '%{http_code}' http://127.0.0.1:8099/no/such/path)"
           echo "GET /no/such/path   -> $miss_status"
           if [ "$miss_status" != "200" ] || ! grep -q 'id="stage"' "$body"; then
             echo "::error::an unknown path did not fall back to the game shell"
+            exit 1
+          fi
+
+          # The image has to keep declaring a healthcheck: it is what the host's stack
+          # status reports, and losing it from the Dockerfile would be invisible until a
+          # deploy.
+          hc="$(docker inspect --format '{{if .Config.Healthcheck}}present{{else}}MISSING{{end}}' tanks-evolved-ci)"
+          echo "image healthcheck    -> $hc"
+          if [ "$hc" != "present" ]; then
+            echo "::error::the image no longer declares a HEALTHCHECK"
             exit 1
           fi
 

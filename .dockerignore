@@ -1,8 +1,8 @@
-# Keeps the build context down to the files the image actually serves. The COPYs in
-# the Dockerfile name those paths explicitly, so nothing here is load-bearing for the
-# image contents — the point is not shipping the rest of the repo to the daemon, and
-# making a future `COPY . .` not silently drag tools/ and the git history into an HTTP
-# root.
+# The build context for `server/Dockerfile`, which is built from the repository root
+# because the image serves the client that lives above server/. The COPYs name their paths
+# explicitly, so nothing here is load-bearing for the image contents — the point is not
+# shipping the rest of the repo to the daemon, and making a future `COPY . .` not silently
+# drag the test harness and the git history into an image.
 
 # Version control and this file's own history: the checkout is not the artifact.
 .git
@@ -19,14 +19,10 @@ tools/
 # Repo documentation, not site content.
 README.md
 
-# This file and the compose file are inputs to the build, not outputs of it.
-docker-compose.yml
-
-# The Phase 1 server's local state and its test suite. Both builds ignore these: the static
-# site has no use for them, and the server image is built from this same context
-# (`docker build -f server/Dockerfile .`), where a local database must not be uploaded to
-# the daemon — it is one `COPY . .` away from being baked into an image. server/ itself is
-# NOT ignored here, because that build needs server/index.js and server/lib/.
+# The server's local state and its test suite. Nothing at runtime reads them, and a local
+# database must not be uploaded to the daemon — it is one `COPY . .` away from being baked
+# into an image. server/ itself is NOT ignored, because the build needs server/index.js and
+# server/lib/.
 server/data
 server/test
 

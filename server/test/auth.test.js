@@ -348,7 +348,7 @@ async function runChecks(dataDir) {
     return '404 for an unknown path, 405 + Allow for the wrong method, all application/json';
   });
 
-  await check('16. the static client keeps nginx.conf\'s MIME, cache, fallback and 304 rules', async () => {
+  await check('16. the static client keeps its MIME, cache, fallback and 304 rules', async () => {
     const css = await call('GET', '/css/style.css');
     assert(css.status === 200 && /^text\/css/.test(css.headers.get('content-type') || ''),
       `/css/style.css served as ${css.headers.get('content-type')}`);

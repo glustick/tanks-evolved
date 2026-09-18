@@ -3,14 +3,12 @@
  *
  * The rule is an allowlist, not a document root. The repository root also holds server/
  * (this code and the SQLite database) and tools/, and pointing a file server at it would
- * publish both over HTTP — which is exactly why the nginx image copies only index.html,
- * css/ and js/ into its document root. Three prefixes are cheaper to keep correct than a
- * document root plus a list of things to exclude.
+ * publish both over HTTP. Naming three prefixes is cheaper to keep correct than serving a
+ * document root and maintaining a list of things to exclude from it.
  *
- * Anything not on the list is not a 404: it falls through to index.html, matching
- * nginx.conf's `try_files $uri $uri/ /index.html`. The game has no router, so an unknown
- * path is a stale bookmark or a shared URL with an extra segment, and serving the shell
- * means the game still boots.
+ * Anything not on the list is not a 404: it falls through to index.html. The game has no
+ * router, so an unknown path is a stale bookmark or a shared URL with an extra segment,
+ * and serving the shell means the game still boots.
  */
 'use strict';
 
@@ -45,7 +43,7 @@ const SERVABLE = [/^index\.html$/, /^(?:css|js)\/(?!\.)[A-Za-z0-9._-]+$/];
 const FALLBACK = 'index.html';
 
 /**
- * The same two rules nginx.conf applies, for the same reason: index.html carries the
+ * Two cache rules, for the same reason: index.html carries the
  * build's version and must be revalidated, while css/ and js/ keep byte-identical URLs
  * between releases so they cannot use a long immutable TTL. `no-cache` is not `no-store`
  * — the browser may keep its copy but has to revalidate, so a repeat visit costs a 304
