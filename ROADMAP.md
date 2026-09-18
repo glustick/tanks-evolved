@@ -109,6 +109,38 @@ phase cheap, and it is the shape everything below has.
   no spawn inside a wall, a firing line across 50 seeds, a wall hit against a shot over
   the top, and hash sensitivity.
 
+### Tank movement with action points
+
+A turn is now a drive and a shot, relayed together. Each tank gets **8 action points** a
+turn, 8 units each, spent moving forward toward the enemy or backward; the player then
+aims from where the tank ended up and fires.
+
+- The numbers were chosen against the map rather than picked. A crater radius is 62 units,
+  so one turn's 64 units climbs a tank out of a crater it is sitting in, and 64 units is
+  4% of the map and 5% of the spawn separation — repositioning matters without making
+  range-finding pointless.
+- Driving goes through the existing simulation, one terrain sample at a time, resolved by
+  the same call the settling phase uses. A measured 80-unit drop lands at 283.333 units/s
+  either way, bit for bit, and costs the same integrity: driving off a ledge and having the
+  ground blown out from under you are one code path.
+- Cover stops a tank at its face rather than refusing the move, and only the block's
+  footprint in x is tested, never its height — so "is the wall in the way" has one answer
+  whatever the tank is standing on. A press that moved nothing is not charged.
+- A turn stays one entry in the replay log — `(move, angle, power, hash)` — so reconnect is
+  still a replay, and the opponent sees the whole turn at once rather than watching a drive.
+- Action points reset each turn and are deliberately **not** in `stateHash`: they are a fact
+  about the turn, not the board, and the drive they bought is already in the hash as the
+  tank's position.
+- `shots.move` arrived through the existing guarded migration as `NOT NULL DEFAULT 0`, so
+  stored turns read as "did not move" rather than NULL — NULL would replay as a different
+  board and turn every stored match into a desync. Tested by dropping the column, rebooting
+  and replaying the log onto its stored hashes.
+- **No stored replay is invalidated.** The opening board fingerprints identically to the
+  build before this change, and every line the determinism suite printed beforehand is
+  unchanged.
+- Covered by checks 18–22 of `tools/check-determinism.js` and checks 16–18 of
+  `server/test/match.test.js`.
+
 ## Next
 
 ### Hardening before this faces the internet
@@ -131,47 +163,13 @@ outside the network.
 
 Ideas that are not scheduled. Ordered roughly by how much they would add.
 
-### Tank movement, with action points each turn
-
-Requested. Give each tank a budget of action points every turn and let the player spend
-them driving forward or backward across the terrain, then aim and fire with what is left
-of the turn.
-
-*Why it matters:* the tanks are static, so a bad position is permanent and a match comes
-down to aim alone. Being able to reposition — to climb out of a crater, to drop behind a
-ridge, to close or open the range — is the missing half of the tactics, and it is what
-would make the destructible terrain matter to movement and not only to damage.
-
-**The part to get right first is the relay.** The whole netcode rests on a turn being a
-small set of numbers both machines can replay, and today that set is
-`(seed, playerIndex, angle, power)`: `js/game.js` fires from it, the shot row in
-`server/lib/db.js` stores it, and `POST /api/games/:id/shot` carries it. Movement makes
-that `(…, move)` — and `move` has to travel the same path and land in the same row. If a
-client moves without telling the server, the two boards diverge and the match is reported
-as a desync that neither player caused; storing it in the log is also what keeps reconnect
-working, since rebuilding from a reload is a replay of that log.
-
-Movement should go through the existing simulation rather than being applied as a
-teleport. The tank state already models ground support, falling and fall damage, and
-`js/tanks.js` says so in its header — "tanks are static in Phase 0: no driving, no fuel,
-they do fall when a shell removes the ground beneath them". Driving off a ledge should
-drop the tank and cost it integrity, exactly as a crater edge does now, so "the ground
-under a tank changed" stays one code path instead of two.
-
-Reverses a Phase 0 decision: tank movement was listed as deliberately out of scope, in
-`js/tanks.js` and in the README's Phase 0 scope.
-
-Worth deciding when it is picked up: whether the move is spent before aiming as one
-combined action or as its own step, whether the opponent sees the move as it happens or
-only the resulting board, and whether a tank can be driven somewhere it cannot shoot from.
-
 ### Weapon pickups, dropped across the battlefield
 
 Requested. Seed the map with weapon crates that a tank drives over to collect, replacing
 whatever it is firing — rockets, lasers, grenades, mortars — dropped at random but
 **evenly**, so the layout does not hand one player the match.
 
-**This depends on tank movement** (the entry above). "Run over" needs a tank that can
+**This depends on tank movement**, which has shipped. "Run over" needs a tank that can
 drive. Without it a pickup is only reachable by the accident of a shell landing on one, or
 by spawning underneath a tank, which is not the feature.
 
