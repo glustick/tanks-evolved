@@ -127,11 +127,14 @@
     queue: function () { return request('POST', PATHS.queue); },
     leaveQueue: function () { return request('DELETE', PATHS.queue); },
 
-    // The match. A shot is three numbers and a fingerprint: the aim to replay, and the
-    // board the sender was looking at when it fired. The server relays the first two and
-    // compares the third, which is all it can do without simulating anything.
-    shot: function (id, angle, power, stateHash) {
-      return request('POST', gamePath(id) + '/shot', { angle: angle, power: power, stateHash: stateHash });
+    // The match. A turn is the driving, the aim and a fingerprint: the move to replay,
+    // the two numbers to fire, and the board the sender was looking at when it fired.
+    // The server relays the first three and compares the last, which is all it can do
+    // without simulating anything.
+    shot: function (id, move, angle, power, stateHash) {
+      return request('POST', gamePath(id) + '/shot', {
+        move: move, angle: angle, power: power, stateHash: stateHash
+      });
     },
     chat: function (id, text) { return request('POST', gamePath(id) + '/chat', { text: text }); },
     // The outcome, from this client's point of view. Two reports that agree is what ends

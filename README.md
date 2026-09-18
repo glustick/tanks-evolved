@@ -23,13 +23,40 @@ See [ROADMAP.md](ROADMAP.md) for what has shipped and what is next.
 
 ## Phase 0 scope
 
-In: two static tanks on seed-derived terrain, turn-based aiming, gravity + wind +
-drag ballistics, heightfield craters, blast falloff damage and fall damage,
-integrity bars, per-turn wind, seeded PRNG, win screen + rematch, WebAudio SFX and
-ambience, a modern dark HUD.
+In: two tanks on seed-derived terrain, turn-based aiming, gravity + wind + drag
+ballistics, heightfield craters, blast falloff damage and fall damage, integrity bars,
+per-turn wind, seeded PRNG, win screen + rematch, WebAudio SFX and ambience, a modern dark
+HUD.
 
 Out (deliberately, for Phase 0): server, matchmaking, chat, accounts, AI opponent,
-weather, multiple weapons, tank movement.
+weather, multiple weapons, tank movement. Movement is the first of those to be picked back
+up — see [Movement](#movement) — and the rest still stand.
+
+## Movement
+
+In: a turn is a drive and a shot. Each tank gets **8 action points** every turn and spends
+them driving forward and backward along the terrain before it aims and fires, so a turn is
+one decision made from the position it ends in. The budget comes back whole at the start of
+every turn; points are not banked.
+
+A tank *walks* the surface rather than being slid along it: it moves one terrain sample at
+a time and the ground under it is re-read at every one. Driving off a ledge — the wall of a
+crater, or anything steeper than the tracks will hold — leaves the surface and drops the
+tank down the same falling path a shell-driven collapse uses, and costs whatever that fall
+costs. A barrier stops it at the face, and a press that did not move the tank is not
+charged for. On the terrain this game generates there are no cliffs, so a drive is free
+unless it goes off something a shell made; the mechanism is the shared one rather than a
+second one that only driving can reach.
+
+The move is relayed, stored and replayed: a turn is `(move, angle, power, stateHash)`, and
+`move` is a signed whole number of action points, positive toward the enemy. The opponent
+sees the whole turn at once rather than watching the tank drive, and a client that reloads
+rebuilds the board by replaying drives and shots in order, the way it always rebuilt it
+from shots.
+
+Out (deliberately, for now): no fuel and no unit limit, so the drive is a per-turn budget
+rather than something that runs out; no aiming penalty for having driven; and the cover
+stays solid to a tank's tracks, so there is no driving over or onto a barrier.
 
 ## Lobby scope (Phase 2)
 
@@ -41,17 +68,17 @@ Out (Phase 3): playing the networked match, which is the next section.
 
 ## Match scope (Phase 3)
 
-In: a game that is `playing` becomes a real match between the two players. Your turn aims
-and fires through the server; their turn locks the board and says who you are waiting
-for. The opponent's shot is applied through the same simulation, so both boards stay
+In: a game that is `playing` becomes a real match between the two players. Your turn drives,
+aims and fires through the server; their turn locks the board and says who you are waiting
+for. The opponent's turn is applied through the same simulation, so both boards stay
 identical, and each one fingerprints what it has after every turn. In-match chat.
 Presence — connected or away — and a walkover if the other player never comes back. A
 match ends with a recorded winner, and both players return to the lobby. Reload the page
-mid-match and you rejoin it: the seed and the shot log *are* the board, so catching up is
+mid-match and you rejoin it: the seed and the turn log *are* the board, so catching up is
 replaying them.
 
-What the server does **not** do is simulate. A shot is `(angle, power, stateHash)`: it is
-relayed, stored in the game's replay log and compared at the end. The two clients are the
+What the server does **not** do is simulate. A turn is `(move, angle, power, stateHash)`: it
+is relayed, stored in the game's replay log and compared at the end. The two clients are the
 only things that know what the world looks like, and both of them report the result before
 it is accepted.
 
@@ -64,6 +91,8 @@ box and the rematch keys work exactly as they always did.
 | --- | --- | --- |
 | Angle | `W` / `S` or `↑` / `↓` | Angle slider, drag on the battlefield |
 | Power | `A` / `D` or `←` / `→` | Power slider, drag on the battlefield |
+| Drive forward | `E` | **Forward →** button |
+| Drive back | `Q` | **← Back** button |
 | Fine adjust | hold `Shift` with any aim key | — |
 | Fire | `Space` | **Fire** button |
 | Rematch (same seed) | `R` | Win screen → **Rematch** |
@@ -85,14 +114,14 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `js/utils.js` | World constants, math helpers, mulberry32 PRNG, named seed streams, wind roll. |
 | `js/terrain.js` | Seed-derived heightfield generation, surface queries, crater destruction. |
 | `js/physics.js` | Shell integration (gravity, wind, drag) and swept terrain/tank/out-of-bounds collision. |
-| `js/tanks.js` | Tank state: position, tilt, integrity, aim, muzzle geometry, falling + fall damage. |
+| `js/tanks.js` | Tank state: position, tilt, integrity, aim, muzzle geometry, the walk that drives it along the surface, falling + fall damage. |
 | `js/render.js` | Canvas drawing, shell-following camera, particle FX, in-canvas HUD. |
-| `js/input.js` | Keyboard + sliders + canvas-drag aiming, fire, seed/rematch/mute wiring, DOM HUD updates. |
-| `js/game.js` | Match/turn state machine, craters + damage, wind per turn, win/rematch, app bootstrap. |
+| `js/input.js` | Keyboard + sliders + canvas-drag aiming, the drive controls and action-point row, fire, seed/rematch/mute wiring, DOM HUD updates. |
+| `js/game.js` | Match/turn state machine, the turn's move and the walk behind it, craters + damage, wind per turn, win/rematch, app bootstrap. |
 | `js/audio.js` | Procedural WebAudio SFX (fire, explosion, armour hit, fanfare) and the ambient bed. |
 | `js/net.js` | The server from the browser: the `/api` calls over fetch, the SSE stream over EventSource, and the file:// guard that makes both opt-in. |
 | `js/screens.js` | The register / login and lobby screens, and the connection indicator — DOM only, no requests of its own. Hands a `playing` game to `js/match.js` and takes the board back when the match is over. |
-| `js/match.js` | The networked match: the turn lock, the shot relay, the replay that rebuilds a board from the seed and the shot log, the chat panel and the result. |
+| `js/match.js` | The networked match: the turn lock, the turn relay, the replay that rebuilds a board from the seed and the turn log, the chat panel and the result. |
 | `js/selftest.js` | In-page assertion suite, run by opening `index.html#selftest`. |
 | `tools/check-determinism.js` | Node+`vm` determinism suite over the simulation core. |
 | `tools/check-static.js` | Static constraint checks (assets exist, no modules, no external URLs, same-origin requests, DOM id contract, load order). |
@@ -106,7 +135,7 @@ same seed → same terrain, same tank placement, same wind sequence.
 | `server/lib/` | The service itself: routing, static serving, scrypt passwords, cookie sessions, rate limiting, SQLite storage, and the realtime hub — the lobby, the match relay and presence (`lobby.js`). |
 | `server/test/auth.test.js` | 20-check auth suite over real HTTP against a spawned server, no dependencies. |
 | `server/test/lobby.test.js` | 21-check lobby suite: hosting, joining, the queue, the event stream, disconnect cleanup, rate limits, stream bounds. |
-| `server/test/match.test.js` | 16-check match suite: the shot relay, turn ownership, the replay log, chat, results and desyncs, rate limits and the walkover — plus a complete two-player match driven through the API by the real simulation. |
+| `server/test/match.test.js` | 19-check match suite: the turn relay, turn ownership, the replay log, driving, chat, results and desyncs, rate limits, the walkover and the move column's migration — plus two complete two-player matches driven through the API by the real simulation, one of them with driving. |
 | `server/Dockerfile` | `node:24-alpine`, unprivileged, healthchecked. Built from the repository root. |
 | `.github/workflows/ci.yml` | CI: the Node suites, the browser checks, the container smoke test, and image publication. |
 
@@ -137,7 +166,7 @@ PORT=9000 TANKS_DB=/tmp/t.db node server/index.js # or point it somewhere else
 | `POST /api/games/:id/join` | join an open game: it becomes `playing` with a **server-issued seed**, and both players are notified |
 | `DELETE /api/games/:id` | the host cancels an open game |
 | `GET /api/games/:id` | the whole match for its two players only: the game, the ordered `shots`, the `messages`, the `turn`, whose turn it is, and who is present (403 for anyone else) |
-| `POST /api/games/:id/shot` | `{ angle, power, stateHash }` → the next entry in the replay log, relayed to both players. Only the player whose turn it is, and only once per turn |
+| `POST /api/games/:id/shot` | `{ move, angle, power, stateHash }` → the next entry in the replay log, relayed to both players. Only the player whose turn it is, and only once per turn. `move` is a signed whole number of action points within the budget; an out-of-range move is refused rather than clamped, and a turn with no `move` field is a turn that did not drive |
 | `POST /api/games/:id/chat` | `{ text }` → stored and broadcast; trimmed, capped at 500 characters, rate-limited per player |
 | `POST /api/games/:id/result` | `{ winnerUserId, stateHash }` → recorded; **both** players must report the same winner and the same board before the match is finished |
 | `POST /api/queue` | enter the quick-match queue, pairing immediately if somebody is waiting |
@@ -174,7 +203,7 @@ names, each carrying a JSON body:
 | `queue` | your own queue state |
 | `match` | a game you have been put into — the whole match, as below |
 | `game` | the whole match again, after anything about it changed |
-| `shot` | a shot to apply: `{ turn, userId, angle, power, stateHash }` |
+| `shot` | a turn to apply: `{ turn, userId, move, angle, power, stateHash }` |
 | `chat` | one message |
 | `turn` | whose turn it now is |
 | `over` | the match finished, with the winner and why (a report, or a walkover) |
@@ -200,31 +229,44 @@ because they have to outlive the tab that made them.
 
 ### The networked match
 
-The server relays shots and compares fingerprints; it never simulates. A shot is
-`(seed, playerIndex, angle, power)`, the simulation is deterministic, so both machines
+The server relays turns and compares fingerprints; it never simulates. A turn is
+`(seed, playerIndex, move, angle, power)`, the simulation is deterministic, so both machines
 already produce byte-identical results from the same inputs — the server's job is to be
 the shared log and the referee.
 
 ```
-A aims ──POST shot {angle, power, stateHash}──▶ server stores turn N
-                                                ├─▶ A: shot event ─┐
-                                                └─▶ B: shot event ─┤ both apply it with the
-                                                                   │ same code, from the
-                                                                   ▼ same seed
+A drives, aims ──POST shot {move, angle, power, stateHash}──▶ server stores turn N
+                                                ├─▶ A: shot event ─┐ both apply the drive and
+                                                └─▶ B: shot event ─┤ the shot with the same code,
+                                                                   │ from the same seed
+                                                                   ▼
    both boards, fingerprints equal ────────▶ turn N+1, whose turn comes from the shot count
 ```
+
+The move is applied *before* the hash is taken, because the board the turn is committed from
+is the one the tank has already driven on. Applying a move is idempotent — it is measured
+from the frame the turn opened on, not from wherever the board happens to be standing — so
+the shooter's board, which has been driving all turn, and the opponent's, which has not,
+both end up in the same place by running the same function.
 
 | Question | Where the answer comes from |
 | --- | --- |
 | Whose turn is it? | the server: `turn = shots.length + 1`, and the host plays odd turns. A shot from anyone else is a 409 |
 | Has this turn been played? | a UNIQUE index on `(game_id, turn)` in storage, behind a turn check that refuses it first |
-| Are the two boards the same? | each shot carries the hash of the board **as it was fired**; the opponent recomputes it before firing the same shot and compares, and both players report the final hash with the result — a disagreement in the winner *or* the board is recorded as a desync, not a victory |
+| Is the drive legal? | `validate.js`: a signed whole number of action points within the budget, refused rather than clamped. The server can answer that from the number alone, without knowing the map |
+| Are the two boards the same? | each turn carries the hash of the board **as it was played** — drive applied, aim applied, shell not yet fired; the opponent recomputes it before applying the same turn and compares, and both players report the final hash with the result — a disagreement in the winner *or* the board is recorded as a desync, not a victory |
 | Who won? | the two clients, and only if they agree. The server cannot check a result, so it requires both reports rather than taking one |
 | What happens if a client misses a shot? | it fetches the match again — one payload, the seed and the ordered log — and replays it. The same path as a reload, which is the same path as joining |
 
 Because the log *is* the board, a reconnecting client needs no snapshot: rejoin, resync
-after a dropped stream, and a fresh player all replay the same shots from the same seed
+after a dropped stream, and a fresh player all replay the same turns from the same seed
 through the same `TE.match.applyShot()`.
+
+**Adding `move` to the log did not invalidate a stored replay.** A turn that was stored
+before driving existed is a turn with no move in it, the column backfills to `0` rather
+than to NULL, and `0` is the turn that was actually played — so the hashes those rows were
+stored with still verify. The opening board is byte-identical too: movement changed what a
+tank can do after the first turn, not where it starts.
 
 ### Environment
 
@@ -257,7 +299,7 @@ reverse proxy as one client, so that needs fixing before this is exposed publicl
 ```bash
 node server/test/auth.test.js     # 20 checks over real HTTP, no dependencies
 node server/test/lobby.test.js    # 21 checks: the lobby, the queue and the stream
-node server/test/match.test.js    # 16 checks: the relay, chat, results, presence — and a whole match
+node server/test/match.test.js    # 19 checks: the relay, chat, results, presence, movement — and two whole matches
 ```
 
 ## Determinism
@@ -277,19 +319,32 @@ accumulator, so the outcome does not depend on frame rate or on how long a tab w
 hidden. Visual effects use their own seeded stream and frame time; they never feed
 back into game state.
 
+A turn's driving is a whole number of action points, and a point is a fixed distance, so
+the move is a number the two machines can replay rather than a path one of them watched.
+The walk inside a point is a function of the terrain, the cover and the tank's own
+position, so the same three inputs always put the tank in the same place — including the
+fall, which is integrated on the settling phase's own timestep for exactly that reason.
+Action points are given back whole at the start of every turn, which is why they are not
+part of `stateHash()`: how many are left is a fact about the turn, and the driving that was
+spent is already in the hash as the position it moved the tank to.
+
 `TE.game.stateHash(game)` fingerprints the terrain, the cover layout, wind, turn, both
 tanks and the shell, and is what the browser self-test compares across two runs — and what
 the two clients in a networked match compare after every turn, with the server storing each
 turn's value in the replay log so a replay can check itself rather than only agreeing at the
 end. Cover is in there for the same reason the terrain is: two clients that built different
 walls would otherwise agree on the hash while disagreeing about what a shell can hit, which
-is exactly the failure the hash exists to catch.
+is exactly the failure the hash exists to catch. A turn's action points are not in there,
+and for the mirror of that reason: they are handed back whole every turn, so they are a
+fact about the turn rather than about the board, and the drive they bought is already in
+the hash as the position it moved the tank to. A tank that drove out and back fingerprints
+the board it started on, which is what the check asserts.
 
 ## Verification
 
 All three commands are self-contained (no install step, no dependencies).
 
-**1. Simulation core, in Node (17 checks + a range report)**
+**1. Simulation core, in Node (22 checks + a range report)**
 
 ```bash
 node tools/check-determinism.js
@@ -311,10 +366,13 @@ PASS  9. no Math.random() in js/
       13 files scanned, 0 occurrences
 PASS 13. a firing line exists between the two spawns (50 seeds)
       reference 45°/100 arc clears every barrier between the spawns by ≥72.1 units (seed-49 P2 over x=1098); all 108 spawn pairs land a clean shot, the worst 40.7 units from the tank (seed-41 P1); every pair also has aims that break on a barrier
+PASS 19. driving off a ledge drops the tank and costs integrity; the flat costs nothing
+      flat: no fall, no cost. Ledge: an 80-unit drop cost 9.44 integrity and landed at 283.33 units/s — identical to the 283.33 the same drop produces when a shell cuts the ground away. …
 ...
 design: 6 mirrored barriers between x=480 and x=1120, heights 27/42/44 (cap 52)
 design: the 45°/100 arc clears the highest barrier between the spawns by ≥72 units over 54 seeds, and the worst clean shot still lands 41 units from the enemy (blast radius 66)
-17/17 checks passed
+design: 8 action points buy 64 units a turn — 4% of the map and 5% of the spawn separation, and 103% of the 62-unit crater radius a tank has to climb out of
+22/22 checks passed
 ```
 
 **2. Static constraints (7 checks)**
@@ -346,10 +404,10 @@ node tools/check-ui.js           # optional: --shots <dir> to dump screenshots
 ```
 
 `headless-check.sh` runs `index.html` (animation loop live) and
-`index.html#selftest` (17 in-page checks: module load, canvas, DOM id contract,
-terrain/match determinism, crater and damage rules, wind re-roll, keyboard
-routing, a scripted match played to a win, rematch reset, 240 rendered frames,
-seed sanitising, and zero uncaught errors). Expected:
+`index.html#selftest` (19 in-page checks: module load, canvas, DOM id contract,
+terrain/match determinism, crater and damage rules, wind re-roll, driving and the
+turn lock, keyboard routing, a scripted match played to a win, rematch reset, 240
+rendered frames, seed sanitising, and zero uncaught errors). Expected:
 
 ```
 RESULT: PASS
@@ -458,6 +516,13 @@ Tanks usually spawn 900–1400 units apart, so a cross-map shot needs 80–100% 
 A shell removes a crater up to 34 units deep and 62 units wide; a direct hit costs
 52.5 integrity, a point-blank splash 42, and damage falls to zero at 66 units.
 
+A turn's driving is 8 action points of 8 units each, so 64 units — 4% of the map and 5% of
+the spawn separation. It is about the width of a crater (62 units), which is the number
+that matters most: a tank that has been blown into one can climb out of it in a single
+turn. Climbing is unlimited in practice — the ground is a heightfield and a tank is pushed
+onto it — while descending gives way at a gradient of 1.0, and that is what makes a crater
+wall something a tank drops off rather than drives down.
+
 Cover sits in the band between the two spawn groups (`x` from 30% to 70% of the map),
 three barriers per side, each mirrored in the centre so neither player has the better
 position. They are 24–44 units wide and 26–52 units tall above the ground they were built
@@ -481,10 +546,21 @@ destroying it.
 - The camera frames both tanks while aiming and follows the shell while it flies.
   Below `0.45x` the view is clamped, and the ground is drawn continuing past both
   map ends so a zoomed-out view never shows a void.
-- One shell type, no tank movement, no AI — by design for Phase 0. Cover is
+- One shell type, no AI — by design for Phase 0. A tank drives (see
+  [Movement](#movement)) but does not run out of anything: the action points are a
+  per-turn budget, not fuel. Cover is
   **static**: a barrier's height is part of the map and never changes, a shell that breaks
   on one leaves a crater at its foot rather than damaging it. Destructible cover would have
   to enter the replay log the way craters do, and is the deliberate follow-up.
+- **A replay stored before tank movement landed still checks out**, which is not true of
+  the cover pass: a row written before the `move` column existed backfills to `0`, and `0`
+  is the turn it actually played, so the hashes those rows carry still verify. The opening
+  board is byte-identical across the change — movement changed what a tank can do after the
+  first turn, not where it starts — so a match in progress across the deploy keeps working.
+  A drive is carried across a *resync* the same way a half-lined-up aim is, because it is the
+  same kind of thing: the local player's decision about the turn, in no log and on nobody
+  else's board. A full page reload cannot carry either — the client has no memory to carry
+  them in — so both come back from empty, and the tank is where the log left it.
 - **A replay stored before the cover landed will not check out.** `stateHash` now folds in
   the cover layout, so every hash an older build recorded is a different string from the one
   the same board produces now. A finished match in the database is history and unaffected in

@@ -64,7 +64,11 @@ const PLAYERS = {
   // The two that play the whole match in check 13. Reserved for it, so no earlier check
   // has spent any of their shot budget.
   v: 'vera@example.com',
-  w: 'wren@example.com'
+  w: 'wren@example.com',
+  // The pair that drives: the validation in check 16 and the whole match with movement in
+  // check 17. Reserved the same way, and for the same reason.
+  m: 'mira@example.com',
+  n: 'nils@example.com'
 };
 
 // Every limit is set here rather than assumed, because every request in this file comes
@@ -1062,6 +1066,384 @@ async function runWalkoverChecks() {
   });
 }
 
+/**
+ * Checks 16 to 18: tank movement, over the same wire.
+ *
+ * The relay is the part of this that must not be wrong. A turn is now
+ * `(move, angle, power, hash)` and the move has to travel the same path the aim does and
+ * land in the same row, because a client that drove without the server knowing would
+ * replay to a board of its own and be reported as a desync neither player caused. So 16
+ * checks the shape of the wire, 17 checks that two machines replaying `(move, angle,
+ * power)` stay byte-identical over a whole match — and that a third client with nothing
+ * but the seed and the log rebuilds the same board — and 18 checks the one thing that
+ * cannot be tested from scratch: a database that already holds shots written before the
+ * move column existed.
+ */
+async function runMovementChecks() {
+  // The simulation's own budget, read from the shipped constants rather than restated, so
+  // the server's bound is checked against the number the clients actually play by.
+  const MOVE_POINTS = makeClient('BUDGET-PROBE').TE.CONST.MOVE_POINTS;
+
+  await check('16. a turn carries its driving: stored, relayed and bounded by the budget', async () => {
+    const game = await pairUp('m', 'n');
+    const tab = openStream('m');
+    await tab.opened;
+    assert(tab.status === 200, `the stream answered ${tab.status}: ${tab.error}`);
+
+    // 1. Outside the budget is refused rather than clamped, and the client's budget is the
+    //    bound: the server refuses the next point past it and nothing of the attempt is
+    //    recorded. Clamping would be the worst of the three options — the shooter's board
+    //    used its own number and the opponent's would use the server's.
+    const past = MOVE_POINTS + 1;
+    const refusals = [
+      { move: past, why: 'one point past the budget' },
+      { move: -past, why: 'one point past it backwards' },
+      { move: 1000, why: 'absurdly far' },
+      { move: -1000, why: 'absurdly far backwards' },
+      { move: 2.5, why: 'not a whole number of points' },
+      { move: '3', why: 'a string' }
+    ];
+    for (const attempt of refusals) {
+      const res = await call('POST', `/api/games/${game.id}/shot`, {
+        as: 'm', json: { move: attempt.move, angle: 45, power: 60, stateHash: 'probe-' + attempt.why }
+      });
+      assert(res.status === 400, `a move that is ${attempt.why} returned ${res.status} ${res.text}`);
+      assert(res.json.error === 'invalid_move', `${attempt.why} was refused as "${res.json.error}"`);
+    }
+    const afterRefusals = await call('GET', `/api/games/${game.id}`, { as: 'm' });
+    assert(afterRefusals.json.shots.length === 0,
+      `${afterRefusals.json.shots.length} refused turns reached the replay log`);
+
+    // 2. The whole budget is legal, and the move survives the wire, the log and the event.
+    const first = await call('POST', `/api/games/${game.id}/shot`, {
+      as: 'm', json: { move: MOVE_POINTS, angle: 41, power: 68, stateHash: 'MOVE|turn1|' + 'm'.repeat(20) }
+    });
+    assert(first.status === 201, `a full-budget drive was refused: ${first.status} ${first.text}`);
+    assert(first.json.shots[0].move === MOVE_POINTS,
+      `the drive did not survive the wire: ${JSON.stringify(first.json.shots[0])}`);
+    assert(first.json.shots[0].angle === 41 && first.json.shots[0].power === 68,
+      'the aim did not survive alongside it');
+
+    const relayed = await tab.waitFor('shot');
+    assert(relayed.shot.move === MOVE_POINTS,
+      `the relayed turn lost the drive: ${JSON.stringify(relayed.shot)}`);
+
+    // 3. Backwards is negative, and it is the opponent's turn now.
+    const second = await call('POST', `/api/games/${game.id}/shot`, {
+      as: 'n', json: { move: -3, angle: 30, power: 55, stateHash: 'MOVE|turn2|' + 'n'.repeat(20) }
+    });
+    assert(second.status === 201, `driving backwards was refused: ${second.status} ${second.text}`);
+    assert(second.json.shots[1].move === -3, `the reverse did not survive: ${JSON.stringify(second.json.shots[1])}`);
+
+    // 4. A turn with no move at all is a legal turn, and it is not the same thing as a
+    //    clamp: a client from the deploy before this one sends no such field, and the turn
+    //    it played is the turn it always played — the one where the tank did not drive.
+    const legacy = await call('POST', `/api/games/${game.id}/shot`, {
+      as: 'm', json: { angle: 50, power: 70, stateHash: 'MOVE|turn3|' + 'l'.repeat(20) }
+    });
+    assert(legacy.status === 201, `a turn with no move field was refused: ${legacy.status} ${legacy.text}`);
+    assert(legacy.json.shots[2].move === 0,
+      `a turn with no move was recorded as ${JSON.stringify(legacy.json.shots[2].move)}`);
+
+    // And the opponent sees the same log, driving and all.
+    const read = await call('GET', `/api/games/${game.id}`, { as: 'n' });
+    assert(read.json.shots.map((s) => s.move).join(',') === `${MOVE_POINTS},-3,0`,
+      `the log the opponent reads is ${JSON.stringify(read.json.shots.map((s) => s.move))}`);
+    for (const shot of read.json.shots) {
+      assert(typeof shot.move === 'number' && Number.isInteger(shot.move),
+        `turn ${shot.turn} has no usable move: ${JSON.stringify(shot)}`);
+    }
+    tab.close();
+
+    return `budget ${MOVE_POINTS} points: ${refusals.length} out-of-budget drives refused as ` +
+      'invalid_move with nothing written, a full-budget drive and a reverse stored and relayed ' +
+      'verbatim, and a turn with no move field accepted as 0';
+  });
+
+  await check('17. two simulated clients play a whole match with driving and stay byte-identical', async () => {
+    const hostAccount = state.players.m;
+    const guestAccount = state.players.n;
+    assert(hostAccount && guestAccount, 'the two players reserved for the driven match were never registered');
+
+    const game = await pairUp('m', 'n');
+    const seed = game.seed;
+
+    const host = makeClient(seed);
+    const guest = makeClient(seed);
+    assert(stateHash(host) === stateHash(guest), 'two clients on one seed disagree before a turn is played');
+
+    // A drive schedule that is varied, deterministic, and comes back to where it started:
+    // forward, back, still, a step each way. Net zero over five turns, so the tanks stay
+    // near the ground they spawned on and the match is still a match — what is being
+    // measured is the relay, not what driving does to a firing line.
+    const SCHEDULE = [2, -2, 0, 1, -1];
+    const MAX_TURNS = 44;
+    const GRAZE = 36;
+    const GRAZE_UNTIL_TURN = 14;
+
+    let turns = 0;
+    let drives = 0;
+    const movesUsed = new Set();
+
+    while (host.game.world.state !== 'over' && turns < MAX_TURNS) {
+      const turn = turns + 1;
+      const hostToPlay = turn % 2 === 1;
+      const shooter = hostToPlay ? host : guest;
+      const opponent = hostToPlay ? guest : host;
+      const as = hostToPlay ? 'm' : 'n';
+      const move = SCHEDULE[turns % SCHEDULE.length];
+
+      // The drive happens on the shooter's own board first, exactly as it does in the
+      // browser: the player has to see where they are firing from, and the aim is chosen
+      // from there. Nothing about this is relayed but the number of points it cost.
+      shooter.TE.game.applyMove(shooter.game, move);
+      const moved = shooter.game.world.tanks[shooter.game.world.activeIndex].x;
+      const wanted = turn <= GRAZE_UNTIL_TURN ? GRAZE : 0;
+      const aim = solveShot(shooter, wanted);
+      const tank = shooter.game.world.tanks[shooter.game.world.activeIndex];
+      shooter.TE.tank.setAngle(tank, aim.angle);
+      shooter.TE.tank.setPower(tank, aim.power);
+      const reported = stateHash(shooter);
+
+      const res = await call('POST', `/api/games/${game.id}/shot`, {
+        as, json: { move: move, angle: aim.angle, power: aim.power, stateHash: reported }
+      });
+      assert(res.status === 201, `turn ${turn} returned ${res.status} ${res.text}`);
+
+      const stored = res.json.shots[res.json.shots.length - 1];
+      assert(stored.turn === turn, `turn ${turn} was stored as turn ${stored.turn}`);
+      assert(stored.move === move, `turn ${turn} lost its ${move} points of driving on the way through: ${res.text}`);
+      assert(stored.angle === aim.angle && stored.power === aim.power,
+        `turn ${turn} lost the aim: sent ${aim.angle}/${aim.power}, stored ${stored.angle}/${stored.power}`);
+      assert(stored.stateHash === reported, `turn ${turn} lost the hash: sent ${reported}\n  stored ${stored.stateHash}`);
+
+      // Both machines apply the turn — the shooter's board, which has already driven, and
+      // the opponent's, which has not. One function, the same numbers, the same fingerprint.
+      const onShooter = applyShot(shooter, stored);
+      const onOpponent = applyShot(opponent, stored);
+      assert(onShooter === stored.stateHash,
+        `turn ${turn}: the shooter's own board did not reproduce the hash it reported`);
+      assert(onOpponent === stored.stateHash,
+        `turn ${turn}: the opponent's board diverged from the shooter's:\n  shooter:  ${onShooter}\n  opponent: ${onOpponent}`);
+
+      assert(stateHash(host) === stateHash(guest),
+        `after turn ${turn} the two clients disagree:\n  host:  ${stateHash(host)}\n  guest: ${stateHash(guest)}`);
+      assert(host.game.turn === guest.game.turn && host.game.world.activeIndex === guest.game.world.activeIndex,
+        `after turn ${turn} the two clients disagree about whose turn it is`);
+      assert(host.game.world.tanks[0].x === guest.game.world.tanks[0].x &&
+        host.game.world.tanks[1].x === guest.game.world.tanks[1].x,
+        `after turn ${turn} the two clients have their tanks in different places`);
+      if (move !== 0) {
+        assert(moved !== null, 'the drive check read a null position');
+        drives++;
+      }
+      movesUsed.add(move);
+      turns++;
+    }
+
+    assert(turns >= 3, `the match only lasted ${turns} turns — not enough relay to be evidence`);
+    assert(host.game.world.state === 'over',
+      `the match did not reach a win in ${MAX_TURNS} turns (${turns} played, ${host.game.world.shotCount} shots)`);
+    assert(stateHash(host) === stateHash(guest), 'the two clients disagree about the final position');
+    assert(drives > 0, 'not one turn of the match actually drove anywhere');
+    assert(movesUsed.has(0) && movesUsed.has(2) && movesUsed.has(-2),
+      `the schedule did not exercise forward, backward and still: ${[...movesUsed].join(', ')}`);
+
+    const winnerIndex = host.game.world.winner;
+    assert(winnerIndex === 1 || winnerIndex === 2, `unexpected winner: ${winnerIndex}`);
+    const winnerUserId = winnerIndex === 1 ? hostAccount.id : guestAccount.id;
+    const finalHash = stateHash(host);
+
+    const first = await call('POST', `/api/games/${game.id}/result`, {
+      as: 'm', json: { winnerUserId, stateHash: finalHash }
+    });
+    assert(first.status === 200 && first.json.waiting === true, `the first report returned ${first.status} ${first.text}`);
+    const second = await call('POST', `/api/games/${game.id}/result`, {
+      as: 'n', json: { winnerUserId, stateHash: finalHash }
+    });
+    assert(second.status === 200 && second.json.agreed === true,
+      `the two clients agreed and the server did not accept it: ${second.status} ${second.text}`);
+    assert(second.json.game.desync === false, `a driven match that agreed was flagged as a desync: ${second.text}`);
+
+    // The reconnect, which is the reason the move is in the row at all: a client with
+    // nothing but the seed and the log has to rebuild the board both players are looking
+    // at, driving and all.
+    const rejoin = makeClient(seed);
+    const read = await call('GET', `/api/games/${game.id}`, { as: 'm' });
+    const log = read.json.shots;
+    assert(log.length === turns, `the stored log has ${log.length} turns for ${turns} played`);
+
+    let replayed = 0;
+    let replayedDrives = 0;
+    for (const shot of log) {
+      assert(Number.isInteger(shot.move), `turn ${shot.turn} has no integer move to replay`);
+      const hash = applyShot(rejoin, shot);
+      assert(hash === shot.stateHash,
+        `replaying turn ${shot.turn} (move ${shot.move}) produced a different board than the server ` +
+        `stored:\n  replayed: ${hash}\n  stored:   ${shot.stateHash}`);
+      if (shot.move !== 0) replayedDrives++;
+      replayed++;
+    }
+    assert(replayed === turns, `replayed ${replayed} of ${turns} turns`);
+    assert(replayedDrives > 0, 'the replay carried no driving at all');
+    assert(stateHash(rejoin) === finalHash,
+      `the replayed board is not the board the two players ended on:\n  replayed: ${stateHash(rejoin)}\n  played:   ${finalHash}`);
+
+    state.notes.push(`driven match on seed ${seed}: ${turns} turns, ${replayedDrives} of them with driving, ` +
+      `every one byte-identical on both clients and equal to the stored hash`);
+    return `seed ${seed}: ${turns} turns, ${replayedDrives} with driving, every one identical on both clients and ` +
+      `equal to the stored hash; the winner agreed by both reports; a third client rebuilt the final board from ` +
+      `the seed and the ${replayed}-turn log, driving included (${finalHash.slice(0, 40)}…)`;
+  });
+
+  /**
+   * The one thing that cannot be checked from scratch: a database that already holds shots
+   * written before the move column existed.
+   *
+   * The deployed volume is exactly that, so the sequence is played out properly — a server
+   * plays two turns, is stopped, the column is dropped behind its back to put the file
+   * back the way the deployed one is, and a server is booted against it again. What has to
+   * come back is a log that reads as having not moved rather than as NULL, because a NULL
+   * there would replay as a different board and every stored match would be a desync.
+   */
+  await check('18. a database written before the move column still reads its shots as having not moved', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tanks-evolved-migration-'));
+    const dbFile = path.join(dataDir, 'tanks.db');
+    const env = Object.assign({}, process.env, {
+      PORT: '0',
+      HOST: '127.0.0.1',
+      TANKS_DB: dbFile,
+      TANKS_SECURE_COOKIES: '0',
+      TANKS_REGISTER_MAX: String(REGISTER_MAX),
+      TANKS_SHOTS_MAX: String(SHOTS_MAX),
+      TANKS_ABANDON_MS: String(ABANDON_MS),
+      TANKS_SWEEP_MS: String(SWEEP_MS)
+    });
+
+    const outerBase = state.base;
+    const outerPlayers = state.players;
+    let server = startServer(env);
+    let sqlite = null;
+    try {
+      state.base = await waitForListen(server);
+      state.players = {};
+      server.logs.length = 0;
+
+      // Two turns played for real, so the rows are ones a real client would have written.
+      await register('m');
+      await register('n');
+      const game = await pairUp('m', 'n');
+      const client = makeClient(game.seed);
+      const stored = [];
+      for (const as of ['m', 'n']) {
+        const tank = client.game.world.tanks[client.game.world.activeIndex];
+        client.TE.tank.setAngle(tank, 42);
+        client.TE.tank.setPower(tank, 66);
+        const hash = stateHash(client);
+        const res = await call('POST', `/api/games/${game.id}/shot`, {
+          as, json: { angle: 42, power: 66, stateHash: hash }
+        });
+        assert(res.status === 201, `turn ${stored.length + 1} returned ${res.status} ${res.text}`);
+        // Applied the way the browser applies a relayed turn, so the hashes mean something.
+        assert(applyShot(client, res.json.shots[res.json.shots.length - 1]) === hash,
+          'the client could not reproduce its own turn');
+        stored.push(hash);
+      }
+
+      const stop = await stopServer(server);
+
+      // Put the file back the way the deployed volume is: a shots table with no move
+      // column. This is what the ALTER TABLE in db.js exists to catch up with.
+      try {
+        // node:sqlite is experimental on this runtime and says so once, on the way in. The
+        // server under test loads the same module and announces it in its own log; what is
+        // suppressed here is only that announcement landing in the middle of this suite's
+        // output, where it would read as a regression rather than as a fact about Node.
+        const emit = process.emitWarning;
+        process.emitWarning = function (warning, ...rest) {
+          if (typeof warning === 'string' && /experimental feature/i.test(warning)) return undefined;
+          return emit.call(process, warning, ...rest);
+        };
+        try {
+          sqlite = require('node:sqlite');
+        } finally {
+          process.emitWarning = emit;
+        }
+      } catch {
+        throw new Error(`node:sqlite is not available on ${process.version}, so the deployed schema cannot be simulated`);
+      }
+      const raw = new sqlite.DatabaseSync(dbFile);
+      const before = raw.prepare('PRAGMA table_info(shots)').all().map((row) => row.name);
+      assert(before.includes('move'), `the shots table was created without a move column: ${before.join(', ')}`);
+      raw.exec('ALTER TABLE shots DROP COLUMN move');
+      const dropped = raw.prepare('PRAGMA table_info(shots)').all().map((row) => row.name);
+      assert(!dropped.includes('move'), 'the column could not be dropped, so nothing was simulated');
+      const rows = raw.prepare('SELECT turn, angle, power, state_hash FROM shots ORDER BY turn').all();
+      assert(rows.length === 2, `expected 2 pre-migration shots, found ${rows.length}`);
+      raw.close();
+
+      // Boot a server against the file as it was left, which is what a deploy does.
+      server = startServer(env);
+      state.base = await waitForListen(server);
+      server.logs.length = 0;
+
+      const migrated = new sqlite.DatabaseSync(dbFile);
+      const columns = migrated.prepare('PRAGMA table_info(shots)').all();
+      const moveColumn = columns.find((column) => column.name === 'move');
+      migrated.close();
+      assert(moveColumn, 'the move column was never added back');
+      assert(moveColumn.notnull === 1, 'the move column came back nullable');
+      assert(Number(moveColumn.dflt_value) === 0, `the move column defaults to ${moveColumn.dflt_value}`);
+
+      const read = await call('GET', `/api/games/${game.id}`, { as: 'm' });
+      assert(read.status === 200, `the game written before the migration could not be read: ${read.status} ${read.text}`);
+      assert(read.json.shots.length === 2, `the pre-migration log came back as ${read.text}`);
+      for (const shot of read.json.shots) {
+        assert(shot.move === 0,
+          `turn ${shot.turn} reads as move ${JSON.stringify(shot.move)} — the deployed rows did not backfill to 0`);
+        assert(Number.isInteger(shot.move), `turn ${shot.turn} has a move that is not a number: ${JSON.stringify(shot.move)}`);
+        assert(shot.angle === 42 && shot.power === 66, `turn ${shot.turn} lost its aim: ${JSON.stringify(shot)}`);
+      }
+      assert(read.json.game.status === 'playing', `the pre-migration game is ${read.json.game.status}`);
+      assert(read.json.turn === 3, `the pre-migration game claims turn ${read.json.turn}`);
+
+      // And the migrated game can still be played on: a row inserted after the ALTER has to
+      // satisfy the NOT NULL the column came back with.
+      const next = await call('POST', `/api/games/${game.id}/shot`, {
+        as: 'm', json: { move: 4, angle: 44, power: 71, stateHash: 'MIGRATED|turn3|' + 'z'.repeat(20) }
+      });
+      assert(next.status === 201, `a turn after the migration was refused: ${next.status} ${next.text}`);
+      const played = next.json.shots[2];
+      assert(played.move === 4, `the first turn written after the migration stored move ${played.move}`);
+      assert(next.json.shots.map((s) => s.move).join(',') === '0,0,4',
+        `the log after the migration is ${JSON.stringify(next.json.shots.map((s) => s.move))}`);
+
+      // Replaying the stored turns still lands on the hashes they were stored with. That is
+      // the whole reason the backfill has to be 0 rather than NULL: a NULL there replays as
+      // a turn where the tank did not move, on a board where it did, and every match
+      // written before this deploy would report itself as a desync.
+      const replay = makeClient(game.seed);
+      let replayedPre = 0;
+      for (const shot of read.json.shots) {
+        assert(shot.stateHash && shot.stateHash.length > 0, `turn ${shot.turn} has no hash`);
+        assert(applyShot(replay, shot) === shot.stateHash,
+          `replaying pre-migration turn ${shot.turn} did not land on the hash it was stored with`);
+        replayedPre++;
+      }
+      assert(replayedPre === stored.length, `replayed ${replayedPre} of ${stored.length} pre-migration turns`);
+
+      return `${replayedPre} turns written and replayed before the migration, the move column dropped and ` +
+        're-added (NOT NULL, default 0) by the next boot, both old rows reading 0 rather than NULL and still ' +
+        'carrying their aim, hash and replay, and turn 3 played on top of them (log moves 0,0,4)';
+    } finally {
+      state.base = outerBase;
+      state.players = outerPlayers;
+      await stopServer(server);
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+}
+
 // --------------------------------------------------------------------- report
 function report() {
   let failed = 0;
@@ -1116,6 +1498,7 @@ async function main() {
     await runFullMatch();
     await runLimitChecks();
     await runWalkoverChecks();
+    await runMovementChecks();
   } catch {
     // A failed start is already recorded; the suite's own checks come out as "not run".
   }

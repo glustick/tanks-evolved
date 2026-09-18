@@ -34,6 +34,23 @@
     TANK_MIN_POWER: 5,
     TANK_MAX_POWER: 100,
 
+    // Movement. A turn's driving is bought in whole action points, spent before the
+    // shot is fired, and the whole budget comes back at the start of every turn —
+    // points are not banked, so `move` is the entire record of a turn's driving and
+    // nothing about it has to be carried forward or hashed.
+    MOVE_POINTS: 8,           // action points a tank gets every turn
+    MOVE_UNIT: 8,             // world units of x one action point buys
+    // 8 points over a crater's 62-unit radius: a tank sitting in a crater can drive
+    // out of it in one turn, and a tank on the flat can shift 64 units — 4% of the map
+    // and 5% of the 1234-unit spawn separation, so range-finding still has to be done
+    // but a bad position is no longer permanent.
+    MOVE_GRADE_MAX: 1.0,      // steepest descent the tracks will hold (rise per unit x)
+    // Terrain is generated and cratered to a talus limit of 1.45 (terrain.js TALUS),
+    // so 1.0 is the line between ground a tank drives down and ground it drops off:
+    // a hillside is driven, a crater wall is a fall. Past it the tank leaves the
+    // surface and the ordinary falling path takes over, which is the same fall — and
+    // the same damage — a crater edge has always produced.
+
     GRAVITY: 500,             // world units / s^2, pulls shells and falling tanks
     AIR_DRAG: 0.06,           // exponential velocity damping per second
     POWER_SCALE: 9.2,         // muzzle speed (units/s) per point of power

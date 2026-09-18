@@ -8,6 +8,12 @@
  *      └──────────── next player, wind re-rolled ◀─────────────┘
  *   ...or `over` when a tank reaches 0 integrity.
  *
+ * A turn is a drive and a shot, in that order and relayed together: the player spends
+ * action points moving the tank, aims from where it ended up, and fires. One turn is one
+ * entry in the replay log — `(move, angle, power, hash)` — so the two machines replay
+ * the same short set of numbers, and the opponent sees the whole turn at once rather
+ * than watching somebody drive.
+ *
  * The simulation advances on a fixed timestep (CONST.SIM_STEP) with an
  * accumulator, so the same seed and the same inputs always produce the same
  * match regardless of frame rate. No Math.random anywhere: terrain, spawns,
@@ -110,7 +116,12 @@
       shell: null,
       trail: [],
       pastTrails: [],
-      shotCount: 0
+      shotCount: 0,
+      // This turn's driving: the points spent, the net they add up to, and the frame
+      // the whole thing is measured from. None of it is in stateHash() — see there.
+      moveNet: 0,
+      moveUsed: 0,
+      turnStart: []
     };
     beginTurn(game, true);
     return game;
@@ -123,7 +134,123 @@
     w.shell = null;
     w.trail = [];
     w.state = 'aiming';
+    // The budget comes back whole and the turn opens here, which is the position the
+    // turn's move is measured from. Every tank is standing on the ground at this point —
+    // the settling phase waits for that — so the snapshot is where it stands, what the
+    // last shell left of its integrity, and nothing left over in the air.
+    w.moveNet = 0;
+    w.moveUsed = 0;
+    w.turnStart = [];
+    for (var i = 0; i < w.tanks.length; i++) {
+      var t = w.tanks[i];
+      w.turnStart.push({
+        x: t.x, y: t.y, vy: t.vy, onGround: t.onGround,
+        integrity: t.integrity, alive: t.alive
+      });
+    }
     if (game.hooks.onTurn) game.hooks.onTurn(w, game, isFirst === true);
+  }
+
+  /**
+   * The landing the falling path reports, applied: damage, then the fall hook.
+   *
+   * Shared by the settling phase and by a drive, which is the point — a tank that drove
+   * off a ledge and a tank whose ledge was shelled away are the same event as far as the
+   * simulation is concerned, so they go through the same lines and cost the same.
+   */
+  function applyLanding(game, tank, result) {
+    if (!result || !result.landed || result.damage <= 0) return 0;
+    var applied = TE.tank.damage(tank, result.damage);
+    if (game.hooks.onFall) game.hooks.onFall(game.world, game, tank, result, applied);
+    return applied;
+  }
+
+  /**
+   * Put the active tank where `points` action points of driving from the turn's opening
+   * position leaves it — positive is forward, toward the enemy.
+   *
+   * The move is measured from the start of the turn rather than from wherever the board
+   * happens to be standing, and that is what makes it replayable. The shooter has been
+   * driving for the whole turn and is already at the far end of it; the opponent has not
+   * moved yet; a client rebuilding from the log has never seen any of it. Rewinding to
+   * the turn's opening frame first puts all three in the same place, so applying a move
+   * is idempotent and one function serves every board that has to hold it. The rewind
+   * takes the tank's integrity back too: the drive is one action, so what it costs is
+   * settled once, by the walk that is finally committed.
+   *
+   * @returns {{travelled:number, blocked:boolean}}
+   */
+  function applyMove(game, points) {
+    var w = game.world;
+    var index = w.activeIndex;
+    var tank = w.tanks[index];
+    var start = w.turnStart[index];
+    var move = points || 0;
+
+    tank.x = start.x;
+    tank.y = start.y;
+    tank.vy = start.vy;
+    tank.onGround = start.onGround;
+    tank.integrity = start.integrity;
+    tank.alive = start.alive;
+    TE.tank.updateTilt(tank, w.terrain);
+    w.moveNet = move;
+    // The best statement of "spent" a board can make about a move it did not watch
+    // happen. On the board the driving actually happens on, move() keeps the exact
+    // count instead, because driving out and back costs two points rather than none.
+    w.moveUsed = Math.abs(move);
+
+    if (move === 0) return { travelled: 0, blocked: false };
+    return TE.tank.walk(tank, w.terrain, w.cover, move * C.MOVE_UNIT * tank.facing, function (result) {
+      applyLanding(game, tank, result);
+    });
+  }
+
+  /**
+   * Spend one action point driving the active tank: `delta` is +1 forward or -1 back,
+   * which is what the controls send.
+   *
+   * Every press costs a point whichever way it points — the budget buys the turn's
+   * driving, not the distance covered — so a player can always turn round and undo a
+   * step they did not want, at a price. A press the board will not honour changes
+   * nothing: a barrier in the way, a spent budget, or a turn that is not in `aiming`.
+   *
+   * @returns {null|string} null when the tank moved, else the reason it did not
+   */
+  function move(game, delta) {
+    var w = game.world;
+    if (w.state !== 'aiming' || w.winner) return 'not-aiming';
+
+    var tank = w.tanks[w.activeIndex];
+    if (!tank.alive) return 'destroyed';
+    if (w.moveUsed >= C.MOVE_POINTS) return 'spent';
+
+    var net = w.moveNet;
+    var used = w.moveUsed;
+    var next = net + delta;
+    // The turn's net can never reach past the budget, which is the bound the server holds
+    // a relayed move to as well. Unreachable at one point a press; here because this is
+    // the function the rule belongs to.
+    if (Math.abs(next) > C.MOVE_POINTS) return 'out-of-reach';
+
+    var x0 = tank.x;
+    var y0 = tank.y;
+    applyMove(game, next);
+    if (tank.x === x0 && tank.y === y0) {
+      // The walk went nowhere: the tank is against a barrier facing that way. Put the
+      // board back where it was and charge nothing — the point is still the player's to
+      // spend in the other direction.
+      applyMove(game, net);
+      w.moveUsed = used;
+      return 'blocked';
+    }
+    w.moveUsed = used + 1;
+    return null;
+  }
+
+  /** This turn's net driving, in action points: +forward, -back. */
+  function pendingMove(game) {
+    return game.world.moveNet;
   }
 
   /** Fire the active tank's shell. Returns false when it is not allowed. */
@@ -133,6 +260,12 @@
 
     var tank = w.tanks[w.activeIndex];
     if (!tank.alive) return false;
+
+    // The turn's driving is committed here, with the shot: the tank fires from where it
+    // drove to. Doing it here rather than at the key that drove it is what keeps local
+    // play and a relayed turn on one path — both arrive at the move through this call,
+    // and applying a move twice is the same as applying it once.
+    if (w.moveNet) applyMove(game, w.moveNet);
 
     var m = TE.tank.muzzle(tank);
     w.shell = TE.physics.createProjectile(m.x, m.y, tank.angle, tank.power, tank.facing, tank.id, w.wind);
@@ -237,6 +370,14 @@
   function simulateStep(game, dt) {
     var w = game.world;
 
+    // Backstop, not a path anyone will see: a driving fall takes far less than a tank's
+    // integrity on a map this tall, but a tank at 0 cannot fire and the turn would stand
+    // in `aiming` with nothing left able to end it.
+    if (w.state === 'aiming' && !w.tanks[w.activeIndex].alive) {
+      finishTurn(game);
+      return;
+    }
+
     if (w.state === 'flying' && w.shell) {
       var sub = dt / C.SIM_SUBSTEPS;
       for (var s = 0; s < C.SIM_SUBSTEPS; s++) {
@@ -251,11 +392,7 @@
       var falling = false;
       for (var i = 0; i < w.tanks.length; i++) {
         var tank = w.tanks[i];
-        var result = TE.tank.update(tank, dt, w.terrain);
-        if (result && result.landed && result.damage > 0) {
-          var applied = TE.tank.damage(tank, result.damage);
-          if (game.hooks.onFall) game.hooks.onFall(w, game, tank, result, applied);
-        }
+        applyLanding(game, tank, TE.tank.update(tank, dt, w.terrain));
         if (!tank.onGround) falling = true;
       }
       if (!falling) finishTurn(game);
@@ -323,6 +460,13 @@
    * would let two clients agree on a hash while disagreeing about where the walls
    * are — shells would break on one machine and land on the other, and the check
    * that exists to catch exactly that would report agreement.
+   *
+   * The turn's action points are deliberately absent, and it is the same argument the
+   * other way round. They are given back whole at the start of every turn, so how many
+   * are left is a function of the turn rather than of the board, and the driving that
+   * was spent is already here: it moved the tank, and the tank's x and y are in the
+   * hash. Folding the budget in would make two boards that are the same board disagree
+   * about a number that cannot affect a single later shot.
    */
   function stateHash(game) {
     var w = game.world;
@@ -492,6 +636,9 @@
   TE.game = {
     create: create,
     reset: reset,
+    move: move,
+    applyMove: applyMove,
+    pendingMove: pendingMove,
     fire: fire,
     update: update,
     settle: settle,

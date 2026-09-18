@@ -1,9 +1,10 @@
 /**
- * input.js — angle/power controls, firing, turn switching and the DOM HUD.
+ * input.js — angle/power/drive controls, firing, turn switching and the DOM HUD.
  *
- * Three input routes drive the same three actions (set angle, set power, fire):
+ * Four input routes drive the same four actions (set angle, set power, drive a step,
+ * fire):
  *   - keyboard shortcuts
- *   - the HUD range sliders / fire button
+ *   - the HUD range sliders / drive buttons / fire button
  *   - pointer drag on the battlefield canvas
  *
  * This file is the only place that knows about the game's element ids, and
@@ -11,9 +12,9 @@
  * matches the code. The lobby screens keep their own list, in screens.js.
  *
  * The board can be *locked* — setLock() — which is how a networked match stops this
- * player from aiming the tank that is not theirs, firing out of turn, or rebuilding the
- * map underneath both of them. Locking is refusal at the three routes above rather than
- * a hidden button, because every one of them is a way onto the board.
+ * player from aiming the tank that is not theirs, driving it, firing out of turn, or
+ * rebuilding the map underneath both of them. Locking is refusal at the routes above
+ * rather than a hidden button, because every one of them is a way onto the board.
  */
 (function (root) {
   'use strict';
@@ -31,6 +32,7 @@
     'card-p1', 'hp-p1', 'bar-p1', 'aim-p1',
     'card-p2', 'hp-p2', 'bar-p2', 'aim-p2',
     'angle-slider', 'angle-readout', 'power-slider', 'power-readout', 'fire-btn',
+    'move-back', 'move-fwd', 'move-meter', 'move-readout',
     'modal', 'modal-title', 'modal-sub', 'rematch-btn', 'modal-new-seed', 'modal-close'
   ];
 
@@ -39,6 +41,15 @@
     flying: 'SHELL IN FLIGHT',
     settling: 'IMPACT',
     over: 'MATCH OVER'
+  };
+
+  /** Why a drive was refused, in words a player can act on. */
+  var MOVE_REASONS = {
+    'not-aiming': 'not while the shell is in the air',
+    spent: 'no action points left',
+    blocked: 'a barrier is in the way',
+    'out-of-reach': 'too far for one turn',
+    destroyed: 'the tank is destroyed'
   };
 
   // UI-only vocabulary for the "Random" seed button. Date-derived on purpose:
@@ -133,6 +144,11 @@
     var fireHandler = opts.onFire || null;
     var drag = null;
     var listeners = [];
+    // The action-point pips, built once for the life of the controller.
+    var pips = [];
+    // The last refusal, shown where the action points are until something moves. Held
+    // here rather than on the board: it is a fact about a keypress, not about the match.
+    var moveNote = null;
 
     function on(target, type, handler, options) {
       if (!target || !target.addEventListener) return;
@@ -209,6 +225,27 @@
       refresh(true);
     }
 
+    /**
+     * Drive one action point, and say so when the board will not have it.
+     *
+     * The move is applied to the board here rather than held for the shot, because the
+     * player is choosing a firing position and has to be able to see it. A networked
+     * match sends whatever this adds up to along with the shot; nobody else sees the
+     * driving itself (see js/match.js).
+     */
+    function applyMove(delta) {
+      gesture();
+      if (lock) return 'locked';
+      var reason = TE.game.move(game, delta);
+      // A refusal that says nothing reads as a broken key, so it is reported where the
+      // budget is rather than swallowed.
+      moveNote = reason;
+      if (!reason && audio && audio.click) audio.click();
+      else if (reason === 'blocked' && audio && audio.armorHit) audio.armorHit();
+      refresh(true);
+      return reason;
+    }
+
     function fire() {
       gesture();
       if (lock) return;
@@ -254,6 +291,14 @@
           break;
         case 'ArrowDown': case 's': case 'S':
           applyAngle(tank.angle - step, false);
+          break;
+        // Driving is a step rather than a sweep, so it is not the same key shape as the
+        // two sliders: one press, one action point.
+        case 'q': case 'Q':
+          applyMove(-1);
+          break;
+        case 'e': case 'E':
+          applyMove(1);
           break;
         case ' ': case 'Spacebar':
         case 'Enter':
@@ -396,6 +441,8 @@
       on(renderer.canvas, 'pointerleave', onPointerUp);
 
       on(els['fire-btn'], 'click', fire);
+      on(els['move-back'], 'click', function () { applyMove(-1); });
+      on(els['move-fwd'], 'click', function () { applyMove(1); });
       on(els['mute-btn'], 'click', toggleMute);
       on(els['angle-slider'], 'input', function (ev) { gesture(); applyAngle(parseFloat(ev.target.value), false); });
       on(els['power-slider'], 'input', function (ev) { gesture(); applyPower(parseFloat(ev.target.value)); });
@@ -410,6 +457,63 @@
     }
 
     // ------------------------------------------------------------- h-u-d-out
+    /**
+     * The action-point pips, one per point in the simulation's own budget.
+     *
+     * Built here from CONST.MOVE_POINTS rather than written out in index.html, so the
+     * row on screen cannot end up describing a budget the simulation does not have.
+     */
+    function buildMoveMeter() {
+      var meter = els['move-meter'];
+      if (!meter || !doc || !doc.createElement) return;
+      while (meter.firstChild) meter.removeChild(meter.firstChild);
+      pips = [];
+      for (var i = 0; i < C.MOVE_POINTS; i++) {
+        var pip = doc.createElement('i');
+        meter.appendChild(pip);
+        pips.push(pip);
+      }
+    }
+
+    /**
+     * The driving row: what is left of this turn's budget, and why the last press was
+     * refused if it was.
+     *
+     * `moveUsed` is the match's own count of the points spent this turn, so what is left
+     * is the budget minus it — the number on screen is the number the board is playing
+     * by, not a second tally kept up here. A refusal is shown rather than swallowed:
+     * a key that silently does nothing reads as a broken key.
+     */
+    function refreshMove(force) {
+      var world = game.world;
+      var active = world.tanks[world.activeIndex];
+      var left = Math.max(0, C.MOVE_POINTS - world.moveUsed);
+      var canDrive = world.state === 'aiming' && !world.winner && !lock && active.alive;
+
+      if (cache.moveLeft !== left || force) {
+        for (var i = 0; i < pips.length; i++) setClass(pips[i], 'is-spent', i >= left);
+        cache.moveLeft = left;
+      }
+      if (cache.moveCanDrive !== canDrive || force) {
+        if (els['move-back']) els['move-back'].disabled = !canDrive;
+        if (els['move-fwd']) els['move-fwd'].disabled = !canDrive;
+        cache.moveCanDrive = canDrive;
+      }
+
+      // The note belongs to the board it was made about: a new turn, the other player
+      // taking over, the tank being put somewhere else, or the board being locked or
+      // unlocked all retire it. Not `force`: a refusal sets the note and then asks for
+      // the repaint that has to show it.
+      var key = game.turn + ':' + world.activeIndex + ':' + active.x + ':' + (lock || '');
+      if (cache.moveNoteKey !== key) {
+        moveNote = null;
+        cache.moveNoteKey = key;
+      }
+      var note = moveNote && MOVE_REASONS[moveNote] ? MOVE_REASONS[moveNote] : null;
+      setText(els['move-readout'], note || (left + ' / ' + C.MOVE_POINTS));
+      setClass(els['move-readout'], 'is-blocked', Boolean(note));
+    }
+
     function refresh(force) {
       var world = game.world;
       var active = world.tanks[world.activeIndex];
@@ -458,6 +562,7 @@
         setText(els['power-readout'], active.power.toFixed(0) + '%');
         cache.power = active.power;
       }
+      refreshMove(force);
 
       // Fire button availability + active player's accent colour.
       var canFire = world.state === 'aiming' && !world.winner && !lock;
@@ -501,6 +606,7 @@
       setText(els['version-tag'], 'v' + (v.RELEASE_VERSION || '?') + '+b' + (v.BUILD_NUMBER || 0));
       if (els['seed-input']) els['seed-input'].value = String(game.world.seed);
       setText(els['mute-btn'], (audio && audio.isMuted && audio.isMuted()) ? 'Sound off' : 'Sound on');
+      buildMoveMeter();
       bind();
       refresh(true);
     }
@@ -521,6 +627,7 @@
       destroy: destroy,
       applyAngle: applyAngle,
       applyPower: applyPower,
+      applyMove: applyMove,
       applySeed: applySeed,
       randomSeedLabel: randomSeedLabel,
       normaliseSeed: normaliseSeed,

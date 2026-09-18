@@ -88,10 +88,10 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_games_status ON games (status);
 
   -- The replay log, and the whole reason a reloaded tab can rejoin a match in progress: a
-  -- shot is (angle, power) and the simulation is deterministic, so replaying these in turn
-  -- order from the same seed rebuilds exactly the board both players are looking at.
+  -- turn is (move, angle, power) and the simulation is deterministic, so replaying these in
+  -- turn order from the same seed rebuilds exactly the board both players are looking at.
   --
-  -- The hash stored with each one is the fingerprint of the world as that shot was fired.
+  -- The hash stored with each one is the fingerprint of the world as that turn was played.
   -- It is not needed to replay — it is what lets a replay *check itself* at every turn
   -- rather than only agreeing at the end, and what the two clients are compared on when
   -- they report a result.
@@ -104,6 +104,12 @@ const SCHEMA = `
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     angle      REAL    NOT NULL,
     power      REAL    NOT NULL,
+    -- The turn's driving, in whole action points, positive toward the enemy. A count
+    -- rather than a distance because that is what the budget is spent in, so the check
+    -- that a turn was legal is a comparison against the budget and not a measurement of
+    -- the map. A turn that did not move is 0, which is also what every row written before
+    -- driving existed means — see MIGRATIONS.
+    move       INTEGER NOT NULL DEFAULT 0,
     state_hash TEXT    NOT NULL,
     created_at INTEGER NOT NULL
   );
@@ -139,7 +145,9 @@ const SCHEMA = `
  *
  * `backfill` is optional: it is there for a column that has to have a sensible value for
  * rows that already exist. A column that is meaningful only from now on, such as when a
- * match ended, has nothing to say about rows written before it did.
+ * match ended, has nothing to say about rows written before it did — and one whose default
+ * is already the right answer for them needs no statement to say so, which is the case for
+ * shots.move (see below).
  */
 const MIGRATIONS = [
   {
@@ -162,7 +170,19 @@ const MIGRATIONS = [
   // cascade from users is the wrong direction for it.
   { table: 'games', column: 'winner_id', add: 'ALTER TABLE games ADD COLUMN winner_id INTEGER' },
   { table: 'games', column: 'finished_at', add: 'ALTER TABLE games ADD COLUMN finished_at INTEGER' },
-  { table: 'games', column: 'desync', add: 'ALTER TABLE games ADD COLUMN desync INTEGER NOT NULL DEFAULT 0' }
+  { table: 'games', column: 'desync', add: 'ALTER TABLE games ADD COLUMN desync INTEGER NOT NULL DEFAULT 0' },
+  {
+    table: 'shots',
+    column: 'move',
+    add: 'ALTER TABLE shots ADD COLUMN move INTEGER NOT NULL DEFAULT 0'
+    // No backfill, and that is the point rather than an omission. The deployed volume
+    // already holds games with shots in them, and every one of those turns was played
+    // before a turn could include driving — so it did not move, and 0 says exactly that.
+    // SQLite fills existing rows with the column's default, so they read as "did not move"
+    // rather than as NULL, and those replays keep rebuilding the board they always did.
+    // The DEFAULT is load-bearing; the NOT NULL is what stops a turn without a move being
+    // written from here on.
+  }
 ];
 
 /**
@@ -529,9 +549,10 @@ function finishGame(db, id, winnerId, finishedAt, desync) {
 function insertShot(db, shot) {
   try {
     const info = db.prepare(
-      `INSERT INTO shots (game_id, turn, user_id, angle, power, state_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(shot.gameId, shot.turn, shot.userId, shot.angle, shot.power, shot.stateHash, shot.createdAt);
+      `INSERT INTO shots (game_id, turn, user_id, move, angle, power, state_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(shot.gameId, shot.turn, shot.userId, shot.move, shot.angle, shot.power,
+      shot.stateHash, shot.createdAt);
     return Number(info.lastInsertRowid);
   } catch (err) {
     if (isUniqueViolation(err)) return null;
@@ -542,7 +563,8 @@ function insertShot(db, shot) {
 /** A game's shots in turn order — the order they have to be replayed in. */
 function listShots(db, gameId) {
   return db.prepare(
-    'SELECT turn, user_id, angle, power, state_hash, created_at FROM shots WHERE game_id = ? ORDER BY turn ASC'
+    'SELECT turn, user_id, move, angle, power, state_hash, created_at FROM shots ' +
+    'WHERE game_id = ? ORDER BY turn ASC'
   ).all(gameId);
 }
 
@@ -555,6 +577,10 @@ function toPublicShot(row) {
   return {
     turn: Number(row.turn),
     userId: Number(row.user_id),
+    // Whole action points, positive toward the enemy. A row written before driving
+    // existed has no value here of its own; the column's default is what makes it 0,
+    // which is the turn those replays actually played.
+    move: Number(row.move || 0),
     angle: Number(row.angle),
     power: Number(row.power),
     stateHash: String(row.state_hash),

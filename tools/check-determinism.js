@@ -27,6 +27,17 @@
  *  16. the cover layout is part of stateHash
  *  17. the pre-cover tuning numbers are unchanged
  *
+ * ...and the properties tank movement added, on top of 17, which is not decoration here:
+ * the range table and the spawn separation are the numbers every tuning decision and every
+ * stored replay rest on, so a pass that adds driving is only finished when they still read
+ * exactly as they did before it.
+ *
+ *  18. a turn's driving is bounded by the action-point budget, which resets every turn
+ *  19. driving off a ledge drops the tank and costs integrity; driving on the flat does not
+ *  20. a tank cannot end up inside or beyond a barrier
+ *  21. stateHash follows a move and is stable across a replay of the same moves
+ *  22. the same move and shot give the same outcome, twice and through a replay
+ *
  * Checks 12 and 13 run over 50 seeds; check 13 fires real shots over an aim grid
  * for every one of them, which is why the whole suite takes a few seconds.
  *
@@ -727,6 +738,396 @@ check('17. the pre-cover tuning numbers are unchanged', () => {
     'both as they were before the cover';
 });
 
+// ------------------------------------------------------------------ movement
+/**
+ * A heightfield built here rather than by the generator: a plateau, then a step down.
+ *
+ * The generator produces no cliffs — its output is smoothed and every crater is relaxed
+ * to a talus limit of 1.45 rise per unit of x — so the one thing a movement check cannot
+ * get from a seed is a ledge to drive off. What real terrain does is measured in check 19
+ * rather than assumed; this is what the falling path is tested against.
+ */
+function ledgeTerrain(edgeX, topY, bottomY) {
+  const cols = Math.round(C.WORLD_W / C.TERRAIN_STEP) + 1;
+  const heights = new Float64Array(cols);
+  for (let i = 0; i < cols; i++) heights[i] = (i * C.TERRAIN_STEP) < edgeX ? topY : bottomY;
+  return { seed: 'ledge', step: C.TERRAIN_STEP, cols, width: (cols - 1) * C.TERRAIN_STEP, heights };
+}
+
+/**
+ * A game standing on a terrain built by hand, with the turn opened on it.
+ *
+ * `finishTurn` is the real turn rollover — it hands over, re-rolls the wind and re-opens
+ * the action-point budget and the snapshot a move is measured from — so driving through
+ * it is driving through the shipped path and not a copy of it. It hands the turn to the
+ * other tank, so it is called from the seat before the one that is to play: starting on
+ * tank 1 leaves the freshly placed tank 0 to move.
+ */
+function gameOn(terrain, activeX, otherX) {
+  const game = TE.game.create('LEDGE-TEST');
+  game.world.terrain = terrain;
+  game.world.tanks = [TE.tank.create(1, activeX, terrain), TE.tank.create(2, otherX, terrain)];
+  game.world.activeIndex = 1;
+  TE.game.finishTurn(game);
+  return game;
+}
+
+/** Spend `points` action points, one press at a time, and count the refusals. */
+function press(game, points, delta) {
+  let moved = 0;
+  let refused = 0;
+  for (let i = 0; i < points; i++) {
+    if (TE.game.move(game, delta == null ? 1 : delta) === null) moved++; else refused++;
+  }
+  return { moved, refused };
+}
+
+/**
+ * What a whole turn's driving costs and covers, over the seed spread — measured through
+ * the game's own action points rather than a copy of the walk, so this is what a player
+ * would actually pay. The generator has no cliffs (it is smoothed, and every crater is
+ * relaxed to a talus limit of 1.45 rise per unit of x), so the honest answer is expected
+ * to be "flat ground and drivable slope cost nothing"; this is the measurement behind
+ * saying that rather than an assumption about the terrain.
+ */
+function drivingReport() {
+  const worst = { cost: 0, seed: '', id: 0, distance: Infinity, blocked: 0, seeds: SEEDS.length };
+  for (const seed of SEEDS) {
+    for (const index of [0, 1]) {
+      const game = TE.game.create(seed);
+      const world = game.world;
+      // The budget is a turn's, and one tank drives per turn, so pointing the board at the
+      // other tank is all it takes to drive it — the turn snapshot covers both.
+      world.activeIndex = index;
+      const tank = world.tanks[index];
+      const before = tank.integrity;
+      const from = tank.x;
+      press(game, C.MOVE_POINTS, 1);
+      const cost = before - tank.integrity;
+      const distance = Math.abs(tank.x - from);
+      if (cost > worst.cost) {
+        worst.cost = cost;
+        worst.seed = seed;
+        worst.id = tank.id;
+      }
+      worst.distance = Math.min(worst.distance, distance);
+    }
+  }
+  return worst;
+}
+
+check('18. a turn\'s driving is bounded by the action-point budget, which resets every turn', () => {
+  const budget = C.MOVE_POINTS;
+  const reach = budget * C.MOVE_UNIT;
+  const game = TE.game.create('EAGLE-4821');
+  const world = game.world;
+  const tank = world.tanks[0];
+  const startX = tank.x;
+
+  const spent = press(game, budget + 3, 1);
+  assert(spent.moved === budget, `${spent.moved} presses were accepted, expected ${budget}`);
+  assert(spent.refused === 3, `the budget let ${spent.refused - 3} extra presses through`);
+  assert(TE.game.pendingMove(game) === budget, `the turn records ${TE.game.pendingMove(game)} points`);
+  assert(world.moveUsed === budget, `the budget reads ${world.moveUsed} spent`);
+
+  const travelled = tank.x - startX;
+  assert(travelled <= reach + 1e-9, `a ${budget}-point turn travelled ${travelled.toFixed(1)} units, past ${reach}`);
+  assert(travelled > reach * 0.99, `a clear drive covered only ${travelled.toFixed(1)} of ${reach} units`);
+
+  // A drive out and back is two points, not none: the budget buys the turn's driving
+  // rather than the distance it ends up covering.
+  const back = TE.game.move(game, -1);
+  const outAndBack = TE.game.move(game, 1);
+  assert(back !== null && outAndBack !== null, 'the budget ran out before the tank could turn round');
+  assert(world.moveUsed === budget, `out and back left the budget reading ${world.moveUsed}`);
+
+  // Whole budget on flat ground: the tank covers exactly what it paid for. The terrain is
+  // laid down here because a seed's ground decides the answer — a slope costs distance —
+  // and the point of this half is the budget rather than the map.
+  const flatTerrain = ledgeTerrain(C.WORLD_W + 10, 200, 200);
+  const flat = gameOn(flatTerrain, 300, 1300);
+  const flatStart = flat.world.tanks[0].x;
+  const flatSpent = press(flat, budget, 1);
+  assert(flatSpent.moved === budget && flatSpent.refused === 0,
+    `on flat ground ${flatSpent.moved} of ${budget} presses were accepted`);
+  const flatTravelled = flat.world.tanks[0].x - flatStart;
+  assert(Math.abs(flatTravelled - reach) < 1e-9,
+    `on flat ground a ${budget}-point turn covered ${flatTravelled.toFixed(3)} units, expected ${reach}`);
+  assert(Math.abs(flat.world.tanks[0].y - 200) < 1e-9, 'the tank did not stay on the surface');
+
+  // A zero move is the board the turn opened on, whatever the tank did before it.
+  const back2 = TE.game.create('EAGLE-4821');
+  const opening = TE.game.stateHash(back2);
+  const t2 = back2.world.tanks[0];
+  const openingX = t2.x;
+  press(back2, 3, 1);
+  assert(t2.x !== openingX, 'three points of driving left the tank where it was');
+  TE.game.applyMove(back2, 0);
+  assert(t2.x === openingX, 'a move of zero points did not put the tank back');
+  assert(TE.game.stateHash(back2) === opening, 'a move of zero points changed the board');
+
+  report.moveReach = reach;
+  return `budget ${budget} points, ${spent.refused} of ${budget + 3} presses refused, ` +
+    `${travelled.toFixed(1)} units covered (max ${reach}) on ${game.world.seed}'s terrain and exactly ` +
+    `${flatTravelled.toFixed(0)} on the flat; turning round costs a point each way`;
+});
+
+check('19. driving off a ledge drops the tank and costs integrity; the flat costs nothing', () => {
+  // 1. Flat ground, through the shipped game path: nothing falls and nothing is charged.
+  const flat = gameOn(ledgeTerrain(C.WORLD_W + 10, 200, 200), 300, 1300);
+  const flatTank = flat.world.tanks[0];
+  const flatIntegrity = flatTank.integrity;
+  press(flat, C.MOVE_POINTS, 1);
+  assert(flatTank.integrity === flatIntegrity,
+    `driving on flat ground cost ${(flatIntegrity - flatTank.integrity).toFixed(3)} integrity`);
+  assert(Math.abs(flatTank.y - 200) < 1e-9, `the tank left the surface at y=${flatTank.y}`);
+
+  // 2. A ledge: the tank drives to the edge and the ground falls away under it.
+  const edgeX = 340;
+  const game = gameOn(ledgeTerrain(edgeX, 240, 160), edgeX - 20, 1300);
+  const tank = game.world.tanks[0];
+  const before = tank.integrity;
+  press(game, C.MOVE_POINTS, 1);
+
+  assert(tank.y === 160, `the tank ended at y=${tank.y}, not on the ground below the ledge (160)`);
+  assert(tank.onGround, 'the tank was left in the air');
+  assert(tank.x > edgeX, `the tank stopped at x=${tank.x}, short of the edge at ${edgeX}`);
+  const cost = before - tank.integrity;
+  assert(cost > 0, 'an 80-unit drop cost no integrity at all');
+
+  // 3. The claim that matters: this is the same fall, not a second one. The same height
+  //    taken away by a shell instead of driven off produces the same landing, bit for bit,
+  //    because it is the same `TE.tank.update` with the same timestep.
+  const cut = gameOn(ledgeTerrain(edgeX, 240, 160), edgeX + 80, 1300);
+  const cutTank = cut.world.tanks[0];
+  cutTank.y = 240;
+  cutTank.vy = 0;
+  cutTank.onGround = true;
+  let landing = null;
+  for (let i = 0; i < 400 && !(landing && cutTank.onGround); i++) {
+    landing = TE.tank.update(cutTank, C.SIM_STEP, cut.world.terrain);
+  }
+  assert(landing && landing.landed, 'the shell-cut ledge produced no landing');
+
+  // The walk's own landing, reproduced at the same height and from the same rest state.
+  const drive = TELedgeLanding(edgeX, 240, 160, 80);
+  assert(drive.speed === landing.speed,
+    `the same 80-unit drop lands at ${drive.speed} driven and ${landing.speed} shell-cut`);
+  assert(Math.abs(drive.damage - landing.damage) < 1e-12,
+    `the same drop costs ${drive.damage} driven and ${landing.damage} shell-cut`);
+
+  // 4. And what real terrain does, measured rather than asserted.
+  const driving = drivingReport();
+  const costOnRealMaps = driving.cost > 0
+    ? `a whole budget of driving costs at most ${driving.cost.toFixed(2)} integrity ` +
+      `(${driving.seed} P${driving.id})`
+    : 'a whole budget of driving costs no integrity at all, on any of them';
+  return `flat: no fall, no cost. Ledge: an 80-unit drop cost ${cost.toFixed(2)} integrity and landed at ` +
+    `${drive.speed.toFixed(2)} units/s — identical to the ${landing.speed.toFixed(2)} the same drop produces ` +
+    `when a shell cuts the ground away. Over the ${driving.seeds} seeds that ship, ${costOnRealMaps} and every ` +
+    `drive covered at least ${driving.distance.toFixed(0)} of the ${C.MOVE_POINTS * C.MOVE_UNIT} units paid for: ` +
+    'the generator makes no cliffs, and every crater is relaxed to the same talus limit, so the ground a tank ' +
+    'can reach has no step in it taller than the tracks will hold';
+});
+
+/**
+ * The landing a drive off the same ledge produces, measured by walking a tank to the edge
+ * and reading what the walk reports — so part 3 of check 19 compares the shipped walk's
+ * fall against the shipped settling path's, rather than two copies of the arithmetic.
+ */
+function TELedgeLanding(edgeX, topY, bottomY, drop) {
+  const terrain = ledgeTerrain(edgeX, topY, bottomY);
+  const tank = TE.tank.create(1, edgeX - C.TERRAIN_STEP * 2, terrain);
+  let seen = null;
+  TE.tank.walk(tank, terrain, [], C.TERRAIN_STEP * 2, (result) => {
+    if (!seen && result.landed && result.damage > 0) seen = result;
+  });
+  if (!seen) throw new Error('the walk off the ledge reported no landing at all');
+  assert(Math.abs((topY - bottomY) - drop) < 1e-9, 'the ledge is not the height this check assumes');
+  return seen;
+}
+
+check('20. a tank cannot end up inside or beyond a barrier', () => {
+  let checked = 0;
+  let stopped = 0;
+
+  for (const seed of SEEDS) {
+    const game = TE.game.create(seed);
+    const world = game.world;
+    for (const index of [0, 1]) {
+      const fresh = TE.game.create(seed);
+      const w = fresh.world;
+      const tank = w.tanks[index];
+      const steps = Math.round((C.MOVE_POINTS * C.MOVE_UNIT) / C.TERRAIN_STEP);
+      const from = tank.x;
+      for (let i = 0; i < steps; i++) {
+        const beforeX = tank.x;
+        TE.tank.walk(tank, w.terrain, w.cover, C.TERRAIN_STEP * tank.facing, null);
+        // Every step, not only the end of the turn: a walk that passed through a wall and
+        // came out the other side would satisfy a test of the final position alone.
+        assert(!TE.terrain.coverBlocksX(w.cover, tank.x, C.TANK_RADIUS),
+          `${seed} P${tank.id}: the tank is inside a barrier at x=${tank.x.toFixed(2)} after ` +
+          `${((i + 1) * C.TERRAIN_STEP).toFixed(0)} units of a drive`);
+        assert(tank.x >= 0 && tank.x <= C.WORLD_W,
+          `${seed} P${tank.id}: the tank drove off the map to x=${tank.x.toFixed(2)}`);
+        if (tank.x === beforeX) break;
+      }
+      if (tank.x === from) stopped++;
+      checked++;
+    }
+    world.activeIndex = 0;
+  }
+
+  // A barrier laid across the lane, which is the case the seed spread cannot be relied on
+  // to contain: the tank must end short of the near face, with the far side unreachable.
+  const game = TE.game.create('BARRIER-TEST');
+  const world = game.world;
+  const tank = world.tanks[0];
+  // Far enough out that the tank does not start inside it (the hull is TANK_RADIUS and the
+  // barrier has a keep-out of its own), close enough that a turn's reach runs into it.
+  const block = {
+    x: tank.x + 70, w: 60, h: 45,
+    base: TE.terrain.heightAt(world.terrain, tank.x + 70), mirror: false
+  };
+  world.cover = [block];
+  const rect = TE.terrain.coverRect(world.terrain, block);
+  const face = rect.x0 - C.TANK_RADIUS;
+  const pressed = press(game, C.MOVE_POINTS, 1);
+  assert(!TE.terrain.coverBlocksX(world.cover, tank.x, C.TANK_RADIUS),
+    `the tank finished inside the barrier at x=${tank.x.toFixed(2)} (face ${rect.x0.toFixed(2)})`);
+  assert(tank.x <= face + 1e-9,
+    `the tank reached x=${tank.x.toFixed(2)}, past the last clear position ${face.toFixed(2)}`);
+  assert(rect.x0 - tank.x >= C.TANK_RADIUS - 1e-9,
+    `the hull is ${(rect.x0 - tank.x).toFixed(2)} from the face, inside the ${C.TANK_RADIUS} it needs`);
+  assert(rect.x0 - tank.x <= C.TANK_RADIUS + C.TERRAIN_STEP + 1e-9,
+    `the tank stopped ${(rect.x0 - tank.x).toFixed(2)} from the face, further than one step short`);
+  assert(pressed.refused >= 1, 'the barrier did not refuse a single press: the budget was spent against it');
+
+  // And it can drive back out, because a refused press is not charged for.
+  const back = TE.game.move(game, -1);
+  assert(back === null && tank.x < face, `the tank could not reverse away from the barrier (${back})`);
+
+  return `${checked} tanks over ${SEEDS.length} seeds walked a full budget a sample at a time, never inside a ` +
+    `barrier and never off the map (${stopped} of them stopped by one); against a wall laid across the lane it ` +
+    `stopped at x=${tank.x.toFixed(1)} against a face at x=${rect.x0.toFixed(1)} ` +
+    `(${pressed.refused} presses refused, none charged) and reversed out again`;
+});
+
+check('21. stateHash follows a move and is stable across a replay of the same moves', () => {
+  const opening = TE.game.create('EAGLE-4821');
+  const hash0 = TE.game.stateHash(opening);
+
+  const moved = TE.game.create('EAGLE-4821');
+  press(moved, 3, 1);
+  const hash3 = TE.game.stateHash(moved);
+  assert(hash3 !== hash0, 'three points of driving did not change the state hash');
+
+  // Stable across a rebuild: the same moves on a fresh board land on the same hash, which
+  // is the whole claim a relay rests on.
+  const rebuilt = TE.game.create('EAGLE-4821');
+  press(rebuilt, 3, 1);
+  assert(TE.game.stateHash(rebuilt) === hash3,
+    'the same three points of driving produced a different board:\n  ' +
+    `${TE.game.stateHash(rebuilt)}\n  ${hash3}`);
+
+  // Idempotent: applying a turn's move again is applying it once. The shooter's own board
+  // has already driven when the relayed turn arrives, and the opponent's has not, so this
+  // is what lets one function serve both.
+  TE.game.applyMove(moved, 3);
+  assert(TE.game.stateHash(moved) === hash3, 'applying the same move twice moved the tank twice');
+
+  // The budget itself is not in the hash. Driving out and back spends two points and ends
+  // on the board it started from, and has to fingerprint that board.
+  const roundTrip = TE.game.create('EAGLE-4821');
+  press(roundTrip, 1, 1);
+  press(roundTrip, 1, -1);
+  assert(roundTrip.world.moveUsed === 2, `the round trip spent ${roundTrip.world.moveUsed} points`);
+  assert(TE.game.stateHash(roundTrip) === hash0,
+    'two points spent and no distance travelled changed the board\'s fingerprint');
+  assert(TE.game.pendingMove(roundTrip) === 0, 'the round trip did not end with a net of zero');
+
+  // Prefix consistency, which is what makes the live board and the replayed one agree: the
+  // player drives a point at a time, and the relay arrives as one number.
+  const stepwise = TE.game.create('EAGLE-4821');
+  press(stepwise, 3, 1);
+  const atOnce = TE.game.create('EAGLE-4821');
+  TE.game.applyMove(atOnce, 3);
+  assert(TE.game.stateHash(atOnce) === TE.game.stateHash(stepwise),
+    'three points in one call did not land where three presses landed');
+  return `three points of driving move the hash and a rebuild reproduces it; applying the same move twice ` +
+    'does not move the tank twice; a round trip that spends two points and travels nowhere fingerprints as ' +
+    `the board it started on; ${C.MOVE_POINTS} points applied at once land where the same points pressed one ` +
+    'at a time land';
+});
+
+check('22. the same move and shot give the same outcome, twice and through a replay', () => {
+  const seed = 'DRIVE-REPLAY-1';
+  const MOVE = 4;
+  const ANGLE = 52;
+  const POWER = 84;
+
+  /** One turn played for real: drive, aim, fire, land. */
+  function play(game) {
+    TE.game.applyMove(game, MOVE);
+    const tank = game.world.tanks[game.world.activeIndex];
+    TE.tank.setAngle(tank, ANGLE);
+    TE.tank.setPower(tank, POWER);
+    const hash = TE.game.stateHash(game);
+    assert(TE.game.fire(game), 'the shot was refused');
+    TE.game.settle(game);
+    return hash;
+  }
+
+  const a = TE.game.create(seed);
+  const hashA = play(a);
+  const b = TE.game.create(seed);
+  const hashB = play(b);
+  assert(hashA === hashB, `the same input produced different boards:\n  ${hashA}\n  ${hashB}`);
+  assert(TE.game.stateHash(a) === TE.game.stateHash(b),
+    'the same input produced the same turn hash and then parted');
+  assert(a.world.tanks[0].x === b.world.tanks[0].x && a.world.tanks[0].y === b.world.tanks[0].y,
+    'the two boards put the tank in different places');
+  assert(a.world.tanks[0].x !== TE.game.create(seed).world.tanks[0].x,
+    'the drive did not move the shooter at all — this check would prove nothing');
+
+  // The relay's own case: the turn applied to a board that was already driven by the
+  // shooter (the same board again) and to one that was not (a fresh board).
+  const shooter = TE.game.create(seed);
+  press(shooter, MOVE, 1);
+  const opponent = TE.game.create(seed);
+  const turn = { move: MOVE, angle: ANGLE, power: POWER };
+  const onShooter = applyRelayed(shooter, turn);
+  const onOpponent = applyRelayed(opponent, turn);
+  assert(onShooter === onOpponent,
+    `the shooter's board and the opponent's fingerprint the same turn differently:\n  ` +
+    `${onShooter}\n  ${onOpponent}`);
+  assert(onShooter === hashA, 'the relayed turn did not reproduce the turn that was played');
+  assert(TE.game.stateHash(shooter) === TE.game.stateHash(opponent), 'the two boards ended apart');
+
+  // And a replay: the seed and the ordered log, from nothing else.
+  const replay = TE.game.create(seed);
+  applyRelayed(replay, turn);
+  TE.game.settle(replay);
+  assert(TE.game.stateHash(replay) === TE.game.stateHash(a),
+    'a replay of the turn did not rebuild the board it was played on');
+
+  return `move ${MOVE}, ${ANGLE}°/power ${POWER}: identical twice, and a board already driven and one that ` +
+    'was not both fingerprint the relayed turn the same way and end on the same board as the turn that was ' +
+    'played';
+});
+
+/** A relayed turn applied the way js/match.js applies one: move, aim, fingerprint, fire. */
+function applyRelayed(game, turn) {
+  TE.game.applyMove(game, turn.move);
+  const tank = game.world.tanks[game.world.activeIndex];
+  TE.tank.setAngle(tank, turn.angle);
+  TE.tank.setPower(tank, turn.power);
+  const hash = TE.game.stateHash(game);
+  TE.game.fire(game);
+  TE.game.settle(game);
+  return hash;
+}
+
 // ------------------------------------------------- terrain / range report
 function rangeReport() {
   const lines = [];
@@ -807,6 +1208,18 @@ if (coverReport) {
   console.log(`design: the 45°/100 arc clears the highest barrier between the spawns by ≥` +
     `${coverReport.minClear.toFixed(0)} units over ${coverReport.seeds} seeds, and the worst clean shot ` +
     `still lands ${coverReport.worstBest.toFixed(0)} units from the enemy (blast radius ${C.BLAST_RADIUS})`);
+}
+
+// Design assumption behind movement: a turn's driving has to be worth spending and small
+// enough that range-finding still has to be done, so it is a fraction of the map and about
+// one crater across. Measured against the numbers above rather than asserted from the cap.
+if (report.moveReach) {
+  const fraction = (report.moveReach / C.WORLD_W) * 100;
+  const separation = Math.abs(makeWorld('EAGLE-4821').tanks[1].x - makeWorld('EAGLE-4821').tanks[0].x);
+  console.log(`design: ${C.MOVE_POINTS} action points buy ${report.moveReach} units a turn — ` +
+    `${fraction.toFixed(0)}% of the map and ${((report.moveReach / separation) * 100).toFixed(0)}% of the ` +
+    `spawn separation, and ${((report.moveReach / C.CRATER_RADIUS) * 100).toFixed(0)}% of the ` +
+    `${C.CRATER_RADIUS}-unit crater radius a tank has to climb out of`);
 }
 
 const total = results.length;

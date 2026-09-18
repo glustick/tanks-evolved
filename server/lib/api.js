@@ -12,11 +12,11 @@
  * The HTTP rules live here and the bookkeeping lives in lobby.js: this file decides what
  * a 409 means, that module decides who is connected and who is waiting.
  *
- * Nothing in this file simulates. A shot is relayed and its hash recorded, never
- * replayed and never judged: the two clients are the only things that know what the
- * world looks like, and the server's whole contribution to "are they in step" is to
- * compare what they say. That is a property worth stating plainly, because it is the
- * reason the endpoints here are so short.
+ * Nothing in this file simulates. A turn — the driving, the aim and the hash — is relayed
+ * and recorded, never replayed and never judged: the two clients are the only things that
+ * know what the world looks like, and the server's whole contribution to "are they in
+ * step" is to compare what they say. That is a property worth stating plainly, because it
+ * is the reason the endpoints here are so short.
  */
 'use strict';
 
@@ -328,13 +328,14 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
   }
 
   /**
-   * Take a shot.
+   * Take a turn.
    *
-   * Three things are checked, and none of them is about the shot's quality because the
+   * Three things are checked, and none of them is about the turn's quality because the
    * server cannot judge that: it is not the client that decides whose turn it is (the
    * shot count does), it is not the client that decides whether this turn has been
-   * played (the UNIQUE index does), and the aim is bounds-checked so that what is stored
-   * is what both clients will fire rather than what each of them clamps to.
+   * played (the UNIQUE index does), and the driving and the aim are bounds-checked so
+   * that what is stored is what both clients will replay rather than what each of them
+   * clamps to.
    *
    * The response is the whole match state, so a client that lost its stream between
    * firing and being told what happened is answered rather than left guessing.
@@ -346,7 +347,7 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
     enforceRateLimit('shots', ctx.req, `u${user.id}`);
 
     const body = await readJsonBody(ctx.req, config.bodyLimitBytes);
-    const { angle, power, stateHash } = requireShot(body);
+    const { move, angle, power, stateHash } = requireShot(body);
 
     const game = storage.toPublicGame(row);
     const turn = storage.listShots(database, id).length + 1;
@@ -356,16 +357,17 @@ function createApi({ config, database, version, limiters, lobby, now = Date.now 
 
     const createdAt = now();
     const inserted = storage.insertShot(database, {
-      gameId: id, turn, userId: user.id, angle, power, stateHash, createdAt
+      gameId: id, turn, userId: user.id, move, angle, power, stateHash, createdAt
     });
     // The index, not the check above: two requests for one turn can only both reach here
     // from the same player, and this is where the second one loses.
     if (inserted === null) throw httpError(409, 'turn_played', `turn ${turn} has already been played`);
 
     const shot = storage.toPublicShot({
-      turn, user_id: user.id, angle, power, state_hash: stateHash, created_at: createdAt
+      turn, user_id: user.id, move, angle, power, state_hash: stateHash, created_at: createdAt
     });
-    logger.info(`game ${id} turn ${turn}: shot by user ${user.id} at ${angle}° / ${power}%`);
+    logger.info(`game ${id} turn ${turn}: shot by user ${user.id} at ${angle}° / ${power}%` +
+      (move ? `, drove ${move} point${move === 1 || move === -1 ? '' : 's'}` : ''));
     lobby.notifyShot(id, shot);
 
     return { status: 201, body: lobby.gameState(id) };

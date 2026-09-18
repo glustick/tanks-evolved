@@ -84,6 +84,15 @@
           <input id="power-slider" type="range" min="5" max="100" step="1" value="60" />
           <output id="power-readout" for="power-slider">60%</output>
         </div>
+        <!-- Driving. The pips in #move-meter are built from CONST.MOVE_POINTS by
+             input.js, so what is on screen is the simulation's own budget rather than a
+             second copy of the number that can drift from it. -->
+        <div class="move-row">
+          <button id="move-back" class="btn tiny ghost" type="button" title="Drive backward (Q)">&larr; Back</button>
+          <span class="move-meter" id="move-meter" aria-hidden="true"></span>
+          <output id="move-readout" for="move-fwd">8 / 8</output>
+          <button id="move-fwd" class="btn tiny ghost" type="button" title="Drive forward (E)">Forward &rarr;</button>
+        </div>
         <button id="fire-btn" class="btn fire" type="button">Fire <kbd>space</kbd></button>
       </section>
 
@@ -101,6 +110,7 @@
     <p class="shortcuts">
       <kbd>A</kbd><kbd>D</kbd> power
       <kbd>W</kbd><kbd>S</kbd> angle
+      <kbd>Q</kbd><kbd>E</kbd> drive
       <kbd>Shift</kbd> fine
       <kbd>Space</kbd> fire
       <kbd>R</kbd> rematch

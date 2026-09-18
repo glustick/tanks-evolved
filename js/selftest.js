@@ -233,6 +233,65 @@
       return '6 turns: [' + seen.map(function (v) { return v.toFixed(3); }).join(', ') + ']';
     });
 
+    check('driving spends the turn budget, walks the ground and resets next turn', function () {
+      TE.game.reset(app.game, 'DRIVE-TEST');
+      var game = app.game;
+      var tank = game.world.tanks[game.world.activeIndex];
+      var budget = TE.CONST.MOVE_POINTS;
+      var start = tank.x;
+      var moved = 0;
+      var refused = 0;
+
+      for (var i = 0; i < budget + 2; i++) {
+        if (TE.game.move(game, 1) === null) moved++; else refused++;
+      }
+      assert(moved === budget, 'took ' + moved + ' presses, expected ' + budget);
+      assert(refused === 2, 'the budget let ' + refused + ' extra presses through');
+      assert(game.world.moveUsed === budget, 'the budget reads ' + game.world.moveUsed);
+      assert(TE.game.pendingMove(game) === budget, 'the turn records ' + TE.game.pendingMove(game) + ' points');
+
+      var travelled = tank.x - start;
+      assert(travelled > 0, 'the tank did not move at all');
+      assert(travelled <= budget * TE.CONST.MOVE_UNIT + 1e-9,
+        'the tank travelled ' + travelled.toFixed(1) + ' units on a ' + budget + '-point budget');
+      assert(Math.abs(tank.y - TE.terrain.heightAt(game.world.terrain, tank.x)) < 1e-9,
+        'the tank walked off the surface');
+      assert(!TE.terrain.coverBlocksX(game.world.cover, tank.x, TE.CONST.TANK_RADIUS),
+        'the tank finished inside a barrier');
+
+      // The HUD reads its number off the board, so it must agree with it.
+      app.controller.refresh(true);
+      var readout = root.document.getElementById('move-readout').textContent;
+
+      // The next turn hands the budget back whole, and the tank opens where it stands.
+      TE.game.finishTurn(game);
+      assert(game.world.moveUsed === 0 && TE.game.pendingMove(game) === 0, 'the budget did not come back');
+      var next = game.world.tanks[game.world.activeIndex];
+      assert(next.x === game.world.turnStart[game.world.activeIndex].x, 'the turn opened on a stale position');
+      return 'P' + tank.id + ' drove ' + travelled.toFixed(1) + ' units in ' + moved + ' points (' +
+        refused + ' refused), HUD read "' + readout + '", budget reset on turn ' + game.turn;
+    });
+
+    check('a locked board refuses to drive', function () {
+      TE.game.reset(app.game, 'LOCK-TEST');
+      var game = app.game;
+      var tank = game.world.tanks[game.world.activeIndex];
+      var before = tank.x;
+
+      // What a networked match does on the opponent's turn: the lock is the client's half
+      // of a rule the server enforces on its own, so it has to cover driving too.
+      app.controller.setLock('not your turn');
+      var refused = app.controller.applyMove(1);
+      assert(refused === 'locked', 'a locked board let the press through (' + refused + ')');
+      assert(tank.x === before, 'the tank moved on a locked board');
+      assert(game.world.moveUsed === 0, 'the budget was spent on a locked board');
+
+      app.controller.setLock(null);
+      assert(app.controller.applyMove(1) === null, 'the board did not unlock');
+      assert(tank.x !== before, 'the tank did not move once unlocked');
+      return 'refused while locked (' + refused + '), drove once unlocked';
+    });
+
     check('the match can be played to a win, with the win overlay showing', function () {
       TE.game.reset(app.game, 'WIN-TEST');
       var game = app.game;

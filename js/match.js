@@ -1,26 +1,26 @@
 /**
  * match.js — the networked match: two boards, one game, kept in step by relaying shots.
  *
- * The whole design rests on one property of the simulation: a shot is
- * `(seed, playerIndex, angle, power)` and both machines produce byte-identical results.
- * So nothing here asks the server what the world looks like. The server relays the aim
- * and compares fingerprints; each client runs the same simulation the other one is
- * running, from the same seed, on the same shots.
+ * The whole design rests on one property of the simulation: a turn is
+ * `(seed, playerIndex, move, angle, power)` and both machines produce byte-identical
+ * results. So nothing here asks the server what the world looks like. The server relays
+ * the move and the aim and compares fingerprints; each client runs the same simulation
+ * the other one is running, from the same seed, on the same turns.
  *
  * That is also what makes a reconnect cheap. There is no server-side board to fetch and
- * no snapshot to apply — the seed and the ordered shot log *are* the board, so rejoining
+ * no snapshot to apply — the seed and the ordered log *are* the board, so rejoining
  * is replaying the log through the same code the live client used. `replay()` below is
  * the only place that does it, and a rejoin and a live turn both go through `applyShot()`,
  * because a catch-up that took a different path could land somewhere else.
  *
  * What "the same state" means precisely, since the fingerprint has to agree exactly:
- * a shot's hash is taken with the shooter's aim applied and before the shell is fired.
- * At that moment both boards hold the same terrain, the same wind, the same tank
- * positions and both tanks' aims — the other player's aim is whatever they last fired,
- * because a locked board cannot change it — so the opponent recomputes the same string
- * before firing the same shot. A mismatch there is the earliest possible sign that the
- * two boards have parted, which is why the receiver checks it on every turn rather than
- * only at the end.
+ * a turn's hash is taken with the move applied, the shooter's aim applied and the shell
+ * not yet fired. At that moment both boards hold the same terrain, the same wind, the
+ * same tank positions and both tanks' aims — the other player's aim is whatever they
+ * last fired, because a locked board cannot change it — so the opponent recomputes the
+ * same string before firing the same turn. A mismatch there is the earliest possible
+ * sign that the two boards have parted, which is why the receiver checks it on every
+ * turn rather than only at the end.
  *
  * What this file is not: it does not decide anything. Whose turn it is, whether a shot is
  * allowed and who won are all the server's answers or the server's comparisons. This end
@@ -147,8 +147,15 @@
   // --------------------------------------------------------------- simulation
 
   /**
-   * Apply one relayed shot to the local board: set the shooter's aim, fingerprint the
-   * result, fire, and let it land.
+   * Apply one relayed turn to the local board: drive the tank, set the shooter's aim,
+   * fingerprint the result, fire, and let it land.
+   *
+   * The move goes on first, and before the hash is read, because that is the board the
+   * turn is committed from: the shooter has already spent the turn driving on its own
+   * machine, so what the opponent has to reproduce is the position after the driving,
+   * not before it. Applying a move twice is the same as applying it once (js/game.js
+   * applyMove measures from the turn's opening frame), which is why the shooter's own
+   * board can take this path unchanged rather than being a special case.
    *
    * The aim is *set from the message* rather than read from the tank, so the board does
    * not depend on whether this client happens to have the same numbers sliders: what is
@@ -158,6 +165,7 @@
    */
   function applyShot(game, shot) {
     var tank = game.world.tanks[game.world.activeIndex];
+    TE.game.applyMove(game, shot.move || 0);
     TE.tank.setAngle(tank, shot.angle);
     TE.tank.setPower(tank, shot.power);
     var hash = TE.game.stateHash(game);
@@ -300,10 +308,13 @@
       // — the opponent's board cannot know the aim being lined up, and it is in no log —
       // so without this a stream hiccup mid-aim would silently reset the shot. The other
       // tank's aim is not this player's to invent, so it comes from the log like the rest.
+      // The driving lined up so far travels with the aim, for the same reason: it is the
+      // same player's decision about the same turn and it is in no log either.
       var activeIndex = state.app.game.world.activeIndex;
       var carried = {
         angle: state.app.game.world.tanks[activeIndex].angle,
-        power: state.app.game.world.tanks[activeIndex].power
+        power: state.app.game.world.tanks[activeIndex].power,
+        move: TE.game.pendingMove(state.app.game)
       };
 
       state.app.controller.setFireHandler(sendShot);
@@ -315,6 +326,7 @@
       if (!isNew && board.state === 'aiming' && board.activeIndex === activeIndex && myTurn()) {
         TE.tank.setAngle(board.tanks[activeIndex], carried.angle);
         TE.tank.setPower(board.tanks[activeIndex], carried.power);
+        TE.game.applyMove(state.app.game, carried.move);
       }
     }
 
@@ -389,13 +401,20 @@
   // ------------------------------------------------------------------ actions
 
   /**
-   * Fire: hand the shot to the server and wait for it to come back.
+   * Fire: hand the turn to the server and wait for it to come back.
    *
-   * Nothing moves on this board until the relayed `shot` event arrives, and that is
-   * deliberate — the event is applied by the same code on both machines, so the shooter
-   * is not a special case with its own path onto the board. What is sent is the aim and
-   * the fingerprint of the board as it is now, with this aim applied and the shell not
-   * yet fired: the opponent recomputes exactly that string before firing the same shot.
+   * Nothing moves on this board once the turn has been sent, and that is deliberate — the
+   * event is applied by the same code on both machines, so the shooter is not a special
+   * case with its own path onto the board. What is sent is the turn: the driving spent
+   * (the board has already moved, because the player had to see where they were aiming
+   * from), the aim, and the fingerprint of the board as it is now — with the move applied,
+   * the aim applied and the shell not yet fired. The opponent recomputes exactly that
+   * string before firing the same turn.
+   *
+   * The opponent sees the whole turn at once rather than watching the tank drive: the
+   * move is relayed with the shot, not as it happens. That is the price of a turn being
+   * one entry in the log, and it is the right price — a turn is one decision, and a turn
+   * that arrived in two pieces would have two moments at which the two boards could part.
    */
   function sendShot() {
     if (!isActive() || state.pending || !myTurn()) return;
@@ -411,7 +430,8 @@
 
     armPendingTimeout();
 
-    TE.net.shot(gameId(), tank.angle, tank.power, hash).then(function (result) {
+    TE.net.shot(gameId(), TE.game.pendingMove(state.app.game), tank.angle, tank.power, hash)
+      .then(function (result) {
       if (!result.ok) {
         // Not pending any more: nothing was relayed, so there is nothing to wait for and
         // the board is the player's again.

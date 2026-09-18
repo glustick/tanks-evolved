@@ -38,6 +38,17 @@ const ANGLE_MAX = 90;
 const POWER_MIN = 5;
 const POWER_MAX = 100;
 
+/**
+ * How far a turn may drive, in whole action points, positive toward the enemy.
+ *
+ * Again the simulation's own limit (js/utils.js CONST.MOVE_POINTS), duplicated here for
+ * the same reason as the aim above. It is a count of points rather than a distance in
+ * world units because that is the unit the budget is spent in: the server can say "that
+ * is more than a turn can drive" from the number alone, without knowing the map, the
+ * terrain or where the tank is standing.
+ */
+const MOVE_MAX = 8;
+
 // The state hash is a fingerprint string the client builds, not something the server
 // parses. It has to be bounded so it cannot be used to fill the database a turn at a
 // time, and non-empty so an unverifiable turn is refused rather than stored as a blank.
@@ -102,7 +113,7 @@ function requirePassword(body) {
 }
 
 /**
- * Pull a shot out of a request body.
+ * Pull a turn out of a request body.
  *
  * Rejected rather than clamped, and this is the one place where that matters most: the
  * server never simulates, so a value it lets through is a value both clients will act on.
@@ -110,8 +121,15 @@ function requirePassword(body) {
  * the opponent's (which used the server's) diverge from the same turn onwards, with a
  * matching turn number and no way to tell which of them is wrong.
  *
- * @throws httpError 400 when the aim is missing, not a number, out of range, or the hash
- *   is missing, empty or absurd
+ * `move` is the one field that may be absent, and that is not a clamp: a client from the
+ * previous deploy sends no such field, and "it sent no move" and "it sent a move of 0"
+ * mean the same turn — the one a player who does not drive plays. A move that is
+ * *present* and out of range is still refused, because a number the client acted on and
+ * the server then rounded is exactly the divergence this function exists to prevent.
+ *
+ * @throws httpError 400 when the aim is missing, not a number, out of range, the move is
+ *   not a whole number of action points a turn can spend, or the hash is missing, empty
+ *   or absurd
  */
 function requireShot(body) {
   const angle = body.angle;
@@ -124,13 +142,22 @@ function requireShot(body) {
     throw httpError(400, 'invalid_power', `power must be a number in [${POWER_MIN}, ${POWER_MAX}]`);
   }
 
+  let move = 0;
+  if (body.move !== undefined && body.move !== null) {
+    if (!Number.isInteger(body.move) || body.move < -MOVE_MAX || body.move > MOVE_MAX) {
+      throw httpError(400, 'invalid_move',
+        `move must be a whole number of action points in [${-MOVE_MAX}, ${MOVE_MAX}]`);
+    }
+    move = body.move;
+  }
+
   const stateHash = body.stateHash;
   if (typeof stateHash !== 'string' || stateHash.length === 0 || stateHash.length > STATE_HASH_MAX) {
     throw httpError(400, 'invalid_state_hash',
       `stateHash must be a string of 1 to ${STATE_HASH_MAX} characters`);
   }
 
-  return { angle, power, stateHash };
+  return { move, angle, power, stateHash };
 }
 
 /**
@@ -200,6 +227,7 @@ module.exports = {
   ANGLE_MAX,
   POWER_MIN,
   POWER_MAX,
+  MOVE_MAX,
   MESSAGE_MAX,
   STATE_HASH_MAX
 };
