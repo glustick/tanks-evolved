@@ -448,9 +448,12 @@ browser in the way.
 
 ## Docker
 
-The site is static, so the image is just `nginx:1.30-alpine` with this directory copied
-into its document root. No build stage and no Node in the image — the visitor's browser
-is what runs the JS.
+Two images live here, and only one of them is deployed. **The server image is the
+deployment** — `server/Dockerfile`, published to GHCR, carrying the Node service that
+serves the game and the API from one origin; see [Server](#server). The image described in
+this section is the **self-host** one: `nginx:1.30-alpine` with this directory copied into
+its document root, no Node and no build step, for hosting the game alone with no accounts
+or lobby. It is built from this repo and is no longer published to a registry.
 
 ```bash
 docker build -t tanks-evolved .
@@ -486,7 +489,7 @@ the test harness at the same URLs as the game.
 | `browser` | `22` | `tools/headless-check.sh`, then `node tools/check-ui.js`, against the runner's Chrome |
 | `docker` | — | `docker build`, then `curl` the running container for real game markup |
 | `server` | `24` | `node server/test/auth.test.js`, then `node server/test/lobby.test.js`, then `node server/test/match.test.js` |
-| `publish` | — | Builds and pushes both images — **only** on `main` or a `v*` tag, and only after every check above has passed |
+| `publish` | — | Builds and pushes the **server** image — **only** on `main` or a `v*` tag, and only after every check above has passed |
 
 The browser job resolves `google-chrome`/`chromium` on the runner and passes the path
 through `CHROME`. Both tools exit `2` when they cannot find a browser, and CI turns that
@@ -498,6 +501,12 @@ The publish job tags the image `latest`, `sha-<short>` and the `RELEASE_VERSION`
 run-scoped `GITHUB_TOKEN` — no long-lived registry secret. GHCR creates a new package
 **private**; the first time it publishes, set the package to public once in the repo's
 package settings, and every later push stays public.
+
+**Only the server image is published.** It is the one anything deploys, because it serves
+the client from the same origin as `/api/`. The nginx image is still built by the `docker`
+job — that smoke test is a real check of the client and of the nginx rules the server's
+static handler mirrors — but it is a self-host artifact now, built from this repo rather
+than pulled, so publishing it on every commit was work nobody consumed.
 
 ## Tuning
 

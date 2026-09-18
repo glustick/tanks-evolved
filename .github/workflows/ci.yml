@@ -249,34 +249,26 @@ jobs:
             TAGS+=("${{ github.ref_name }}")
           fi
 
-          # Two images, two Dockerfiles, one context. The static image is the nginx host
-          # the game has always been; the server image is the Node service that serves the
-          # same client plus /api/. Both are built from the repository root because the
-          # client lives above server/.
-          push_image() {
-            local image="$1" dockerfile="$2"
-            local args=()
-            for t in "${TAGS[@]}"; do args+=(-t "$image:$t"); done
-            docker build "${args[@]}" -f "$dockerfile" .
-            for t in "${TAGS[@]}"; do
-              echo "pushing $image:$t"
-              docker push "$image:$t"
-            done
-          }
+          # One image. The server serves the client from the same origin as /api/, so it
+          # is the only artifact anything deploys: the nginx image was built and pushed on
+          # every commit for a stack nothing runs any more. The docker job still builds it,
+          # because its smoke test is a genuine check of the client and of the nginx rules
+          # the server's static handler mirrors — but publishing it was work nobody consumed.
+          IMAGE="ghcr.io/${{ github.repository }}-server"
+          ARGS=()
+          for t in "${TAGS[@]}"; do ARGS+=(-t "$IMAGE:$t"); done
 
-          STATIC="ghcr.io/${{ github.repository }}"
-          SERVER="ghcr.io/${{ github.repository }}-server"
+          docker build "${ARGS[@]}" -f server/Dockerfile .
 
-          push_image "$STATIC" Dockerfile
-          push_image "$SERVER" server/Dockerfile
+          for t in "${TAGS[@]}"; do
+            echo "pushing $IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
 
           {
-            echo "### Published images"
+            echo "### Published image"
             echo
-            for image in "$STATIC" "$SERVER"; do
-              echo "\`$image\`"
-              echo
-              for t in "${TAGS[@]}"; do echo "- \`$image:$t\`"; done
-              echo
-            done
+            echo "\`$IMAGE\`"
+            echo
+            for t in "${TAGS[@]}"; do echo "- \`$IMAGE:$t\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
